@@ -1,0 +1,127 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// 用户表
+model User {
+  id           Int       @id @default(autoincrement())
+  username     String    @unique @db.VarChar(50)
+  email        String?   @unique @db.VarChar(100)
+  phone        String?   @unique @db.VarChar(20)
+  passwordHash String    @map("password_hash") @db.VarChar(255)
+  role         String    @default("user") @db.VarChar(20) // user, admin, moderator
+  avatarUrl    String?   @map("avatar_url") @db.Text
+  isActive     Boolean   @default(true) @map("is_active")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  apiKeys       ApiKey[]
+  callLogs      CallLog[]
+  quotaHistory  KeyQuotaHistory[] @relation("AllocatedBy")
+
+  @@map("users")
+}
+
+// API Key 表
+model ApiKey {
+  id         Int       @id @default(autoincrement())
+  userId     Int       @map("user_id")
+  keyName    String    @map("key_name") @db.VarChar(100)
+  keyValue   String    @map("key_value") @unique @db.VarChar(255) // 加密存储
+  keyHash    String?   @map("key_hash") @unique @db.VarChar(64)  // 明文 hash，用于 O(1) 查询鉴权
+  status     String    @default("pending_quota") @db.VarChar(20) // pending_quota, active, revoked, expired
+  quotaTotal Decimal   @default(0) @map("quota_total") @db.Decimal(15,2)
+  quotaUsed  Decimal   @default(0) @map("quota_used") @db.Decimal(15,2)
+  lastUsed   DateTime? @map("last_used")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  callLogs     CallLog[]
+  quotaHistory KeyQuotaHistory[] @relation("Key")
+
+  @@map("api_keys")
+}
+
+// 模型定义表
+model Model {
+  id              Int       @id @default(autoincrement())
+  name            String    @unique @db.VarChar(100) // 平台唯一模型名
+  displayName     String    @map("display_name") @db.VarChar(100)
+  description     String?   @db.Text
+  usageHint       String?   @map("usage_hint") @db.Text
+  source          String    @default("volcano") @db.VarChar(20) // volcano, local
+  modelType       String    @map("model_type") @db.VarChar(20) // video, image, chat, embedding, audio
+  volcanoModelId  String?   @map("volcano_model_id") @db.VarChar(150) // 火山引擎真实模型ID
+  volcanoEndpoint String?   @map("volcano_endpoint") @db.VarChar(200) // 火山API端点覆盖
+  unitCost        Decimal   @default(0.1) @map("unit_cost") @db.Decimal(10,4) // 单价
+  config          Json?     @db.JsonB // 额外配置（自部署服务地址、参数等）
+  status          String    @default("offline") @db.VarChar(20) // online, offline, loading
+  isHot           Boolean   @default(false) @map("is_hot")
+  loadTime        DateTime? @map("load_time")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  callLogs CallLog[]
+
+  @@map("models")
+}
+
+// 调用日志表
+model CallLog {
+  id           BigInt    @id @default(autoincrement())
+  apiKeyId     Int?       @map("api_key_id")
+  userId       Int?       @map("user_id")
+  modelId      Int?       @map("model_id")
+  promptHash   String?   @map("prompt_hash") @db.VarChar(64)
+  responseHash String?   @map("response_hash") @db.VarChar(64)
+  tokensInput  Int?      @map("tokens_input")
+  tokensOutput Int?      @map("tokens_output")
+  durationMs   Int?      @map("duration_ms")
+  cost         Decimal?  @db.Decimal(10,4)
+  status       String    @default("success") @db.VarChar(20) // success, failed, timeout
+  ipAddress   String?   @map("ip_address") @db.VarChar(45)
+  userAgent   String?   @map("user_agent") @db.Text
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  apiKey ApiKey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  model  Model?  @relation(fields: [modelId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([modelId])
+  @@index([createdAt])
+  @@index([apiKeyId])
+  @@map("call_logs")
+}
+
+// Key 配额记录表
+model KeyQuotaHistory {
+  id          BigInt   @id @default(autoincrement())
+  keyId       Int      @map("key_id")
+  amount      Decimal  @db.Decimal(15,2)
+  reason      String?  @db.VarChar(50) // manual, auto, refund
+  allocatedBy Int?     @map("allocated_by")
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  key      ApiKey @relation("Key", fields: [keyId], references: [id], onDelete: Cascade)
+  allocator User?  @relation("AllocatedBy", fields: [allocatedBy], references: [id])
+
+  @@map("key_quota_history")
+}
+
+// 系统设置表
+model SystemSetting {
+  id          Int      @id @default(autoincrement())
+  key        String   @unique @db.VarChar(100)
+  value      String?  @db.Text
+  type       String   @default("string") @db.VarChar(20)
+  description String? @db.Text
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
