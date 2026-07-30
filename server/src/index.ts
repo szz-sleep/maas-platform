@@ -87,9 +87,14 @@ async function main() {
   await app.register(openaiCompatRoutes);
   await app.register(assetRoutes);
 
-  // 启动自部署模型同步（扫描 Ollama 等本地后端）
+  // 启动自部署模型同步（扫描 Ollama、vLLM、Diffusers 等本地后端）
   try {
-    startModelSyncCron(60000, ['http://localhost:11434']);
+    startModelSyncCron({
+      intervalMs: config.sync.intervalMs,
+      ollamaEndpoints: config.sync.ollamaEndpoints,
+      vllmEndpoints: config.sync.vllmEndpoints,
+      diffusersEndpoints: config.sync.diffusersEndpoints,
+    });
     console.log('🔄 模型同步定时任务已启动');
   } catch (err) {
     console.warn('⚠️  模型同步启动失败（后台继续运行）:', err);

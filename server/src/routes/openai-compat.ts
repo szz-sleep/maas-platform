@@ -44,9 +44,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     const { model: modelName, messages, stream, temperature, max_tokens, max_completion_tokens } = body;
 
     if (stream) {
-      return reply.status(400).send({
-        error: { message: 'Stream mode is not yet supported', type: 'invalid_request_error', code: 'stream_not_supported' },
-      });
+      // 流式模式：使用 SSE 实时推送 token
     }
 
     const startTime = Date.now();
@@ -65,15 +63,195 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     }
 
     try {
-      // 自部署模型走 OpenAI 兼容格式
+      // 自部署模型 — 根据模型名判断后端类型
       if (modelRecord.source === 'local') {
-        const baseUrl = (modelRecord.config as any)?.endpoint || 'http://localhost:11434/v1';
-        const resp = await fetch(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: modelName, messages, max_tokens, temperature, stream: false }),
-        });
-        const data = await resp.json() as any;
+        const baseUrl = (modelRecord.config as any)?.endpoint || 'http://localhost:11434';
+        const modelType = modelRecord.modelType || 'chat';
+
+        // 模型名约定: ollama/xxx → Ollama, sd/xxx → SD WebUI, comfy/xxx → ComfyUI
+        // vllm/xxx 或自定义 label/xxx → OpenAI 兼容 (vLLM)
+        const isOllama = modelName.startsWith('ollama/');
+        const isSDWebUI = modelName.startsWith('sd/');
+        const isComfyUI = modelName.startsWith('comfy/');
+        // 去掉前缀，取真实模型名
+        const realModelName = modelName.includes('/') ? modelName.slice(modelName.indexOf('/') + 1) : modelName;
+
+        // ── Diffusers 架构: SD WebUI（图片生成）──
+        if (isSDWebUI && modelType === 'image') {
+          return handleSDWebUIImage(baseUrl, modelName, body, modelRecord, request, reply, startTime);
+        }
+
+        // ── Diffusers 架构: ComfyUI（图片生成）──
+        if (isComfyUI && modelType === 'image') {
+          return handleComfyUIImage(baseUrl, modelName, body, modelRecord, request, reply, startTime);
+        }
+
+        // ── LLM 架构: Ollama / vLLM ──
+
+        if (stream) {
+          // ── 流式模式 ──
+          reply.raw.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          });
+
+          const chatId = 'chatcmpl-' + Date.now();
+
+          try {
+            if (isOllama) {
+              // Ollama native stream
+              const ollamaResp = await fetch(`${baseUrl}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: realModelName, messages, stream: true }),
+              });
+
+              if (!ollamaResp.ok || !ollamaResp.body) {
+                throw new Error('Ollama stream 请求失败');
+              }
+
+              const reader = ollamaResp.body.getReader();
+              const decoder = new TextDecoder();
+              let fullContent = '';
+
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n').filter(l => l.trim());
+                for (const line of lines) {
+                  try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.message?.content) {
+                      fullContent += parsed.message.content;
+                      const sseData = JSON.stringify({
+                        id: chatId,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: modelName,
+                        choices: [{ index: 0, delta: { content: parsed.message.content }, finish_reason: null }],
+                      });
+                      reply.raw.write(`data: ${sseData}\n\n`);
+                    }
+                    if (parsed.done) {
+                      const sseData = JSON.stringify({
+                        id: chatId,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: modelName,
+                        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                        usage: { prompt_tokens: parsed.prompt_eval_count || 0, completion_tokens: parsed.eval_count || 0, total_tokens: (parsed.prompt_eval_count || 0) + (parsed.eval_count || 0) },
+                      });
+                      reply.raw.write(`data: ${sseData}\n\n`);
+                    }
+                  } catch { /* 跳过非 JSON 行 */ }
+                }
+              }
+
+              // 记录日志
+              const cost = Number(modelRecord.unitCost) || 0.01;
+              await prisma.apiKey.update({
+                where: { id: request.apiKeyId },
+                data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+              });
+              await prisma.callLog.create({
+                data: {
+                  apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
+                  promptHash: sha256(JSON.stringify(messages)), responseHash: sha256(fullContent),
+                  tokensOutput: fullContent.length, durationMs: Date.now() - startTime, cost, status: 'success',
+                  ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
+                },
+              });
+            } else {
+              // vLLM OpenAI-compatible stream
+              const vllmResp = await fetch(`${baseUrl}/v1/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: realModelName, messages, max_tokens, temperature, stream: true }),
+              });
+
+              if (!vllmResp.ok || !vllmResp.body) {
+                throw new Error('vLLM stream 请求失败');
+              }
+
+              const reader = vllmResp.body.getReader();
+              const decoder = new TextDecoder();
+              let fullContent = '';
+
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+                for (const line of lines) {
+                  try {
+                    const parsed = JSON.parse(line.slice(6));
+                    if (parsed === '[DONE]') continue;
+                    // 直接转发
+                    reply.raw.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                    const delta = parsed.choices?.[0]?.delta?.content || '';
+                    if (delta) fullContent += delta;
+                  } catch { /* skip */ }
+                }
+              }
+
+              const cost = Number(modelRecord.unitCost) || 0.01;
+              await prisma.apiKey.update({
+                where: { id: request.apiKeyId },
+                data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+              });
+              await prisma.callLog.create({
+                data: {
+                  apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
+                  promptHash: sha256(JSON.stringify(messages)), responseHash: sha256(fullContent),
+                  tokensOutput: fullContent.length, durationMs: Date.now() - startTime, cost, status: 'success',
+                  ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
+                },
+              });
+            }
+          } catch (err) {
+            // 流式错误用 SSE 格式返回
+            const errData = JSON.stringify({
+              error: { message: (err as Error).message, type: 'server_error' },
+            });
+            reply.raw.write(`data: ${errData}\n\ndata: [DONE]\n\n`);
+          }
+
+          reply.raw.write('data: [DONE]\n\n');
+          reply.raw.end();
+          return;
+        }
+
+        // ── 非流式模式 ──
+        let resp: any;
+        let rawText: string;
+        if (isOllama) {
+          // Ollama native /api/chat
+          resp = await fetch(`${baseUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: realModelName, messages, stream: false }),
+          });
+          rawText = await resp.text();
+        } else {
+          // OpenAI-compatible (vLLM etc.)
+          resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: realModelName, messages, max_tokens, temperature, stream: false }),
+          });
+          rawText = await resp.text();
+        }
+
+        let data: any;
+        try { data = JSON.parse(rawText); } catch { throw new Error(`本地模型返回非 JSON: ${rawText.substring(0, 200)}`); }
+        if (!resp.ok || data.error) {
+          throw new Error(data.error?.message || `本地模型返回 ${resp.status}: ${rawText.substring(0, 200)}`);
+        }
+
+        // 提取回复内容（兼容 Ollama 和 OpenAI 格式）
+        const replyText = data.choices?.[0]?.message?.content || data.message?.content || '';
         const cost = Number(modelRecord.unitCost) || 0.01;
         const duration = Date.now() - startTime;
 
@@ -91,7 +269,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
         return {
           id: 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: modelName,
-          choices: [{ index: 0, message: { role: 'assistant', content: data.choices?.[0]?.message?.content || '' }, finish_reason: 'stop' }],
+          choices: [{ index: 0, message: { role: 'assistant', content: replyText }, finish_reason: 'stop' }],
           usage: data.usage || {},
         };
       }
@@ -253,4 +431,150 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       });
     }
   });
+}
+
+// ──────────────────────────────────────────────
+// Diffusers 架构处理函数
+// ──────────────────────────────────────────────
+
+/** 通过 SD WebUI /sdapi/v1/txt2img 生成图片 */
+async function handleSDWebUIImage(
+  baseUrl: string, modelName: string, body: any,
+  modelRecord: any, request: any, reply: any, startTime: number
+) {
+  const { prompt, n, size, response_format } = body;
+  const realModelName = modelName.includes('/') ? modelName.split('/')[1] : modelName;
+
+  try {
+    const sdBody: any = { prompt, negative_prompt: body.negative_prompt || '' };
+    if (n) sdBody.batch_size = n;
+    if (size) {
+      const [w, h] = size.split('x').map(Number);
+      if (w && h) { sdBody.width = w; sdBody.height = h; }
+    }
+
+    const resp = await fetch(`${baseUrl}/sdapi/v1/txt2img`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sdBody),
+    });
+
+    const data = (await resp.json()) as any;
+    if (!resp.ok) throw new Error(`SD WebUI 调用失败 (${resp.status}): ${JSON.stringify(data).substring(0, 200)}`);
+
+    const cost = Number(modelRecord.unitCost) || 0.1;
+    const duration = Date.now() - startTime;
+
+    await prisma.apiKey.update({
+      where: { id: request.apiKeyId },
+      data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+    });
+    await prisma.callLog.create({
+      data: {
+        apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
+        promptHash: sha256(prompt), durationMs: duration, cost, status: 'success',
+        ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
+      },
+    });
+
+    return {
+      created: Math.floor(Date.now() / 1000),
+      data: (data.images || []).map((img: string) => ({
+        b64_json: img,
+        url: response_format === 'url' ? `data:image/png;base64,${img}` : undefined,
+      })),
+    };
+  } catch (err) {
+    return reply.status(500).send({
+      error: { message: (err as Error).message, type: 'server_error' },
+    });
+  }
+}
+
+/** 通过 ComfyUI /prompt API 生成图片 */
+async function handleComfyUIImage(
+  baseUrl: string, modelName: string, body: any,
+  modelRecord: any, request: any, reply: any, startTime: number
+) {
+  const { prompt, negative_prompt, size } = body;
+  const [width, height] = (size || '1024x1024').split('x').map(Number);
+
+  try {
+    // 构建 ComfyUI 基础工作流
+    const workflow = {
+      '3': { class_type: 'KSampler', inputs: { seed: Math.floor(Math.random() * 1e9), steps: 25, cfg: 7, sampler_name: 'euler', scheduler: 'normal', denoise: 1, model: ['4', 0], positive: ['6', 0], negative: ['7', 0], latent_image: ['5', 0] } },
+      '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: modelName.split('/')[1] || '' } },
+      '5': { class_type: 'EmptyLatentImage', inputs: { width, height, batch_size: 1 } },
+      '6': { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['4', 1] } },
+      '7': { class_type: 'CLIPTextEncode', inputs: { text: negative_prompt || '', clip: ['4', 1] } },
+      '8': { class_type: 'VAEDecode', inputs: { samples: ['3', 0], vae: ['4', 2] } },
+      '9': { class_type: 'SaveImage', inputs: { filename_prefix: 'maas', images: ['8', 0] } },
+    };
+
+    // 提交工作流
+    const submitResp = await fetch(`${baseUrl}/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: workflow }),
+    });
+
+    const submitData = (await submitResp.json()) as any;
+    if (!submitResp.ok) throw new Error(`ComfyUI 提交失败: ${JSON.stringify(submitData).substring(0, 200)}`);
+
+    const promptId = submitData.prompt_id;
+
+    // 轮询等待完成（最多 5 分钟）
+    const maxWait = 300000;
+    const pollInterval = 2000;
+    let waited = 0;
+
+    while (waited < maxWait) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      waited += pollInterval;
+
+      const histResp = await fetch(`${baseUrl}/history/${promptId}`);
+      const histData = (await histResp.json()) as any;
+      const entry = histData[promptId];
+
+      if (entry?.outputs) {
+        const outputs = entry.outputs;
+        const images: { b64_json?: string; url?: string }[] = [];
+
+        for (const nodeOutput of Object.values(outputs) as any[]) {
+          for (const img of nodeOutput.images || []) {
+            const fileResp = await fetch(`${baseUrl}/view?filename=${img.filename}&type=${img.type}`);
+            const buffer = await fileResp.arrayBuffer();
+            const b64 = Buffer.from(buffer).toString('base64');
+            images.push({ b64_json: b64, url: `data:image/png;base64,${b64}` });
+          }
+        }
+
+        if (images.length > 0) {
+          const cost = Number(modelRecord.unitCost) || 0.1;
+          const duration = Date.now() - startTime;
+          await prisma.apiKey.update({
+            where: { id: request.apiKeyId },
+            data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+          });
+          await prisma.callLog.create({
+            data: {
+              apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
+              promptHash: sha256(prompt), durationMs: duration, cost, status: 'success',
+              ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
+            },
+          });
+
+          return { created: Math.floor(Date.now() / 1000), data: images };
+        }
+      }
+    }
+
+    return reply.status(408).send({
+      error: { message: 'ComfyUI 生成超时', type: 'timeout' },
+    });
+  } catch (err) {
+    return reply.status(500).send({
+      error: { message: (err as Error).message, type: 'server_error' },
+    });
+  }
 }

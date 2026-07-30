@@ -3,6 +3,7 @@ import prisma from '../config/database';
 import { adminAuth } from '../middleware/auth';
 import { allocateQuotaSchema, modelActionSchema } from '../utils/validators';
 import { decryptApiKey } from '../utils/apiKey';
+import { config } from '../config';
 import { syncModels } from '../services/model-sync';
 
 export default async function adminRoutes(app: FastifyInstance) {
@@ -134,8 +135,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       prisma.apiKey.update({
         where: { id: parseInt(id) },
         data: {
-          quotaTotal: { increment: amount },
-          status: 'active', // 分配额度后自动激活
+          quotaTotal: amount,
+          status: 'active',
         },
       }),
       prisma.keyQuotaHistory.create({
@@ -234,12 +235,14 @@ export default async function adminRoutes(app: FastifyInstance) {
     return { success: true, message: model.source.startsWith('volcano') ? '模型已下线' : '模型已卸载' };
   });
 
-  // 手动触发模型同步（扫描 Ollama/vLLM 等自部署后端）
+  // 手动触发模型同步（扫描 Ollama/vLLM/Diffusers + 火山引擎等所有后端）
   app.post('/api/v1/admin/models/sync', { preHandler: [adminAuth] }, async (request, reply) => {
     try {
       const result = await syncModels({
-        ollamaEndpoints: ['http://localhost:11434'],
-        vllmEndpoints: [],
+        ollamaEndpoints: config.sync.ollamaEndpoints,
+        vllmEndpoints: config.sync.vllmEndpoints,
+        diffusersEndpoints: config.sync.diffusersEndpoints,
+        includeVolcano: true,
       });
       return { success: true, data: result, message: `检测 ${result.detected} 个模型，注册 ${result.registered}，更新 ${result.updated}，下线 ${result.offlined}` };
     } catch (err) {
@@ -280,6 +283,195 @@ export default async function adminRoutes(app: FastifyInstance) {
       prisma.callLog.count({ where }),
     ]);
 
-    return { success: true, data: { items: logs, total, page, limit } };
+    return { success: true, data: { items: logs.map((l: any) => ({ ...l, id: Number(l.id) })), total, page, limit } };
+  });
+
+  // ========== 账单核对 ==========
+
+  // 模型维度账单（每次调用明细 + 汇总）
+  app.get('/api/v1/admin/billing/models', { preHandler: [adminAuth] }, async (request, reply) => {
+    const query = request.query as { startDate?: string; endDate?: string; page?: string; limit?: string; search?: string; source?: string };
+    const startDate = query.startDate ? new Date(query.startDate) : new Date(0);
+    const endDate = query.endDate ? new Date(query.endDate) : new Date();
+    const page = parseInt(query.page || '1');
+    const limit = parseInt(query.limit || '50');
+
+    const where: any = {
+      status: 'success',
+      createdAt: { gte: startDate, lte: endDate },
+    };
+
+    // 来源筛选
+    if (query.source === 'volcano' || query.source === 'local') {
+      where.model = { source: query.source };
+    }
+
+    // 搜索：模糊匹配用户名或模型名
+    if (query.search) {
+      where.OR = [
+        { user: { username: { contains: query.search, mode: 'insensitive' } } },
+        { model: { name: { contains: query.search, mode: 'insensitive' } } },
+      ];
+    }
+
+    const [logs, total] = await Promise.all([
+      prisma.callLog.findMany({
+        where,
+        include: {
+          user: { select: { id: true, username: true } },
+          model: { select: { name: true, source: true, modelType: true } },
+        },
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.callLog.count({ where }),
+    ]);
+
+    // 汇总（按 source 分组 + 总计）
+    const sourceMap = new Map<string, { cost: number; calls: number }>();
+    let totalCostFull = 0, totalCallsFull = 0;
+    for (const l of logs) {
+      const src = l.model?.source || 'unknown';
+      const cost = Number(l.cost || 0);
+      if (!sourceMap.has(src)) sourceMap.set(src, { cost: 0, calls: 0 });
+      const entry = sourceMap.get(src)!;
+      entry.cost += cost;
+      entry.calls++;
+      totalCostFull += cost;
+      totalCallsFull++;
+    }
+    for (const [k, v] of sourceMap) {
+      v.cost = Math.round(v.cost * 10000) / 10000;
+    }
+    totalCostFull = Math.round(totalCostFull * 10000) / 10000;
+
+    const summary = {
+      volcanoCost: sourceMap.get('volcano')?.cost || 0,
+      volcanoCalls: sourceMap.get('volcano')?.calls || 0,
+      localCost: sourceMap.get('local')?.cost || 0,
+      localCalls: sourceMap.get('local')?.calls || 0,
+    };
+
+    // 按 source 分组
+    const groups: { source: string; cost: number; calls: number }[] = [];
+    for (const [src, v] of sourceMap) {
+      groups.push({ source: src, cost: v.cost, calls: v.calls });
+    }
+    groups.sort((a, b) => b.cost - a.cost);
+
+    return {
+      success: true,
+      data: {
+        period: { startDate: query.startDate || 'all', endDate: query.endDate || 'now' },
+        summary,
+        groups,
+        items: logs.map((l: any) => ({
+          id: Number(l.id),
+          user: l.user?.username || '—',
+          model: l.model?.name || '—',
+          source: l.model?.source || 'unknown',
+          modelType: l.model?.modelType || '—',
+          tokensInput: l.tokensInput || 0,
+          tokensOutput: l.tokensOutput || 0,
+          durationMs: l.durationMs,
+          cost: Number(l.cost || 0),
+          status: l.status,
+          createdAt: l.createdAt,
+        })),
+        totalCost: totalCostFull,
+        totalCalls: totalCallsFull,
+        total,
+        page,
+        limit,
+      },
+    };
+  });
+
+  // 用户维度账单（每次调用明细 + 汇总）
+  app.get('/api/v1/admin/billing/users', { preHandler: [adminAuth] }, async (request, reply) => {
+    const query = request.query as { userId?: string; startDate?: string; endDate?: string; page?: string; limit?: string; search?: string; source?: string };
+    const startDate = query.startDate ? new Date(query.startDate) : new Date(0);
+    const endDate = query.endDate ? new Date(query.endDate) : new Date();
+    const page = parseInt(query.page || '1');
+    const limit = parseInt(query.limit || '50');
+
+    const where: any = {
+      status: 'success',
+      createdAt: { gte: startDate, lte: endDate },
+    };
+    if (query.userId) where.userId = parseInt(query.userId);
+
+    if (query.source === 'volcano' || query.source === 'local') {
+      where.model = { source: query.source };
+    }
+
+    if (query.search) {
+      where.OR = [
+        { user: { username: { contains: query.search, mode: 'insensitive' } } },
+        { model: { name: { contains: query.search, mode: 'insensitive' } } },
+      ];
+    }
+
+    const [logs, total] = await Promise.all([
+      prisma.callLog.findMany({
+        where,
+        include: {
+          user: { select: { id: true, username: true } },
+          model: { select: { name: true, source: true, modelType: true } },
+        },
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      }),
+      prisma.callLog.count({ where }),
+    ]);
+
+    // 按用户汇总
+    const userSummaryMap = new Map<number, {
+      username: string; volcanoCost: number; volcanoCalls: number; localCost: number; localCalls: number;
+    }>();
+
+    for (const l of logs) {
+      const uid = l.userId || 0;
+      if (!userSummaryMap.has(uid)) {
+        userSummaryMap.set(uid, { username: l.user?.username || '?', volcanoCost: 0, volcanoCalls: 0, localCost: 0, localCalls: 0 });
+      }
+      const entry = userSummaryMap.get(uid)!;
+      const cost = Number(l.cost || 0);
+      if (l.model?.source === 'volcano') { entry.volcanoCost += cost; entry.volcanoCalls++; }
+      else { entry.localCost += cost; entry.localCalls++; }
+    }
+
+    const totalVolcano = Math.round([...userSummaryMap.values()].reduce((s, e) => s + e.volcanoCost, 0) * 10000) / 10000;
+    const totalLocal = Math.round([...userSummaryMap.values()].reduce((s, e) => s + e.localCost, 0) * 10000) / 10000;
+
+    return {
+      success: true,
+      data: {
+        period: { startDate: query.startDate || 'all', endDate: query.endDate || 'now' },
+        summary: {
+          volcanoCost: totalVolcano, volcanoCalls: [...userSummaryMap.values()].reduce((s, e) => s + e.volcanoCalls, 0),
+          localCost: totalLocal, localCalls: [...userSummaryMap.values()].reduce((s, e) => s + e.localCalls, 0),
+        },
+        items: logs.map((l: any) => ({
+          id: Number(l.id),
+          userId: l.userId,
+          user: l.user?.username || '—',
+          model: l.model?.name || '—',
+          source: l.model?.source || 'unknown',
+          modelType: l.model?.modelType || '—',
+          tokensInput: l.tokensInput || 0,
+          tokensOutput: l.tokensOutput || 0,
+          durationMs: l.durationMs,
+          cost: Number(l.cost || 0),
+          status: l.status,
+          createdAt: l.createdAt,
+        })),
+        total,
+        page,
+        limit,
+      },
+    };
   });
 }

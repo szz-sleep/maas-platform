@@ -21,7 +21,7 @@ export default function AdminKeysPage() {
 
   const handleAllocate = async () => {
     if (!allocating || !allocating.amount) return;
-    const res = await api.put('/api/v1/admin/keys', { keyId: allocating.id, amount: parseFloat(allocating.amount) });
+    const res = await api.put(`/api/v1/admin/keys/${allocating.id}/quota`, { amount: parseFloat(allocating.amount) });
     if (res.success) { setAllocating(null); load(); }
     else alert(res.error?.message || '分配失败');
   };
@@ -84,13 +84,13 @@ export default function AdminKeysPage() {
                   {allocating?.id === k.id ? (
                     <div className="flex gap-1">
                       <input value={allocating!.amount} onChange={e => setAllocating({id: k.id, amount: e.target.value})}
-                        type="number" className="w-20 px-2 py-0.5 border rounded text-xs" placeholder="额度" />
-                      <button onClick={handleAllocate} className="text-xs bg-blue-600 text-white px-2 py-0.5 rounded">确定</button>
+                        type="number" className="w-20 px-2 py-0.5 border rounded text-xs" placeholder={String(k.quotaTotal)} />
+                      <button onClick={handleAllocate} className="text-xs bg-blue-600 text-white px-2 py-0.5 rounded">修改</button>
                       <button onClick={() => setAllocating(null)} className="text-xs text-gray-500 px-1">取消</button>
                     </div>
                   ) : (
                     <div className="flex gap-1 flex-wrap">
-                      <button onClick={() => setAllocating({id: k.id, amount: ''})} className="text-xs text-blue-600 hover:underline">额度</button>
+                      <button onClick={() => setAllocating({id: k.id, amount: String(k.quotaTotal)})} className="text-xs text-blue-600 hover:underline">额度</button>
                       <button onClick={() => handleToggle(k)} title={k.status === 'revoked' ? '启用' : '禁用'}
                         className={`text-xs px-1 rounded ${k.status === 'revoked' ? 'text-green-600 hover:bg-green-50' : 'text-orange-600 hover:bg-orange-50'}`}>
                         {k.status === 'revoked' ? <ToggleRight size={16} /> : <ToggleLeft size={16} />}
