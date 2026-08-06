@@ -540,6 +540,55 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     }
 
     try {
+      // 本地/自部署视频模型：转发给本地视频服务（OpenAI兼容）
+      if (modelRecord.source === 'local' && modelRecord.modelType === 'video') {
+        const baseUrl = (modelRecord.config as any)?.endpoint || 'http://localhost:11434/v1';
+        const videoEndpoint = (modelRecord.config as any)?.videoEndpoint || '/v1/video/generations';
+
+        // 把 prompt 和 images/audios base64 转发给本地视频模型
+        const reqBody: any = { ...body, model: modelRecord.name };
+        // 确保 images 是 data URI（不是纯 base64 也不是 URL）
+        if (Array.isArray(images) && images.length > 0) {
+          reqBody.images = images;
+        }
+        if (Array.isArray(videos) && videos.length > 0) {
+          reqBody.videos = videos;
+        }
+        if (Array.isArray(audios) && audios.length > 0) {
+          reqBody.audios = audios;
+        }
+
+        const resp = await fetch(`${baseUrl}${videoEndpoint}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+        });
+
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          throw new Error(`本地视频模型调用失败 (${resp.status}): ${errText}`);
+        }
+
+        const data = (await resp.json()) as any;
+        const cost = Number(modelRecord.unitCost) || 0.5;
+        const durationMs = Date.now() - startTime;
+        await prisma.apiKey.update({ where: { id: request.apiKeyId }, data: { quotaUsed: { increment: cost }, lastUsed: new Date() } });
+        await prisma.callLog.create({
+          data: {
+            apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
+            promptHash: sha256(prompt || ''), durationMs, cost, status: 'success',
+            ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
+          },
+        });
+
+        return {
+          task_id: data.task_id || data.id || crypto.randomUUID(),
+          status: data.status || 'completed',
+          video_url: data.video_url || data.url || null,
+          error: data.error || null,
+        };
+      }
+
       if (modelRecord.source !== 'volcano' || modelRecord.modelType !== 'video') {
         return reply.status(400).send({
           error: { message: `视频生成仅支持火山引擎视频模型`, type: 'invalid_request_error' },
