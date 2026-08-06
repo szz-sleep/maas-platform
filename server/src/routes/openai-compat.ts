@@ -432,6 +432,93 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     }
   });
 
+  // ── POST /v1/images/edits — 图生图（OpenAI 格式）──
+  // 接受 image (data URI) 或 images (base64 array) 作为参考图，转发给火山 Seedream
+  app.post('/v1/images/edits', { preHandler: [apiKeyAuth] }, async (request, reply) => {
+    const body = request.body as any;
+    const { prompt, model: modelName, image, images, n, size, response_format } = body;
+
+    const startTime = Date.now();
+    const modelRecord = await prisma.model.findUnique({ where: { name: modelName || 'seedream5.0-pro' } });
+    if (!modelRecord) {
+      return reply.status(404).send({ error: { message: `图片生成模型不存在`, type: 'invalid_request_error' } });
+    }
+
+    try {
+      if (modelRecord.source === 'local') {
+        // 自部署模型：img2img
+        const baseUrl = (modelRecord.config as any)?.endpoint || 'http://localhost:7860';
+        const reqBody: any = { prompt, ...body };
+        if (image) reqBody.init_images = [image.startsWith('data:') ? image.split(',')[1] : image];
+        if (Array.isArray(images) && images.length > 0) reqBody.init_images = images;
+        const resp = await fetch(`${baseUrl}/sdapi/v1/img2img`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqBody),
+        });
+        const data = await resp.json() as any;
+        const cost = Number(modelRecord.unitCost) || 0.05;
+        const duration = Date.now() - startTime;
+        await prisma.apiKey.update({ where: { id: request.apiKeyId }, data: { quotaUsed: { increment: cost }, lastUsed: new Date() } });
+        await prisma.callLog.create({
+          data: { apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id, promptHash: sha256(prompt), durationMs: duration, cost, status: 'success', ipAddress: request.ip, userAgent: request.headers['user-agent'] || null },
+        });
+        return { created: Math.floor(Date.now() / 1000), data: (data.images || []).map((img: string) => ({ b64_json: img, url: img.startsWith('data:') ? undefined : img })) };
+      }
+
+      // 火山引擎图片生成（图生图模式）
+      const apiKey = await loadApiKey();
+      const volcanoModel = modelRecord.volcanoModelId || 'doubao-seedream-5-0-pro-260628';
+
+      const reqBody: any = {
+        model: volcanoModel, prompt: prompt || '', n: n || 1, size: size || '1024x1024',
+        response_format: response_format || 'url', output_format: 'png', watermark: false,
+      };
+
+      // 参考图：优先 images 数组，否则 image 字段
+      if (Array.isArray(images) && images.length > 0) {
+        reqBody.image = image.startsWith('data:') ? image : 'data:image/jpeg;base64,' + images[0];
+        // 多余图片通过 images 字段传（若平台支持）
+        if (images.length > 1) reqBody.images = images.slice(1).map((b: string) => b.startsWith('data:') ? b : 'data:image/jpeg;base64,' + b);
+      } else if (image) {
+        reqBody.image = image.startsWith('data:') ? image : 'data:image/jpeg;base64,' + image;
+      }
+
+      const resp = await fetch(`${VOLCANO_BASE}/images/generations`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqBody),
+      });
+
+      const data = (await resp.json()) as any;
+      if (!resp.ok) throw new Error(`图生图失败 (${resp.status}): ${JSON.stringify(data)}`);
+
+      const cost = Number(modelRecord.unitCost) || 0.2;
+      const duration = Date.now() - startTime;
+      await prisma.apiKey.update({
+        where: { id: request.apiKeyId },
+        data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+      });
+      await prisma.callLog.create({
+        data: {
+          apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
+          promptHash: sha256(prompt), durationMs: duration, cost, status: 'success',
+          ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
+        },
+      });
+
+      return {
+        created: Math.floor(Date.now() / 1000),
+        data: (data.data || []).map((img: any) => ({
+          url: img.url || null, b64_json: img.b64_json || null, revised_prompt: img.revised_prompt || null,
+        })),
+      };
+    } catch (err) {
+      return reply.status(500).send({
+        error: { message: (err as Error).message, type: 'server_error' },
+      });
+    }
+  });
+
   // ── POST /v1/video/generations — 视频生成（OpenAI 格式）──
   app.post('/v1/video/generations', { preHandler: [apiKeyAuth] }, async (request, reply) => {
     const body = request.body as any;
