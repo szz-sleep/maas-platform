@@ -522,7 +522,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
   // ── POST /v1/video/generations — 视频生成（OpenAI 格式）──
   app.post('/v1/video/generations', { preHandler: [apiKeyAuth] }, async (request, reply) => {
     const body = request.body as any;
-    const { prompt, model: modelName, duration, ratio, resolution, images, videos, audios, generate_audio, return_last_frame, service_tier } = body;
+    const { prompt, model: modelName, duration, ratio, resolution, images, videos, audios, first_frame, last_frame, generate_audio, return_last_frame, service_tier } = body;
 
     const startTime = Date.now();
 
@@ -545,9 +545,8 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
         const baseUrl = (modelRecord.config as any)?.endpoint || 'http://localhost:11434/v1';
         const videoEndpoint = (modelRecord.config as any)?.videoEndpoint || '/v1/video/generations';
 
-        // 把 prompt 和 images/audios base64 转发给本地视频模型
-        const reqBody: any = { ...body, model: modelRecord.name };
-        // 确保 images 是 data URI（不是纯 base64 也不是 URL）
+        // 把 prompt + 参考素材全量转发给本地视频模型
+        const reqBody: any = { model: modelRecord.name, prompt: prompt || '', ...body };
         if (Array.isArray(images) && images.length > 0) {
           reqBody.images = images;
         }
@@ -556,6 +555,12 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
         }
         if (Array.isArray(audios) && audios.length > 0) {
           reqBody.audios = audios;
+        }
+        if (typeof first_frame === 'string' && first_frame) {
+          reqBody.first_frame = first_frame;
+        }
+        if (typeof last_frame === 'string' && last_frame) {
+          reqBody.last_frame = last_frame;
         }
 
         const resp = await fetch(`${baseUrl}${videoEndpoint}`, {
