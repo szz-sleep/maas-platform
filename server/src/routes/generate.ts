@@ -125,6 +125,126 @@ export default async function generateRoutes(app: FastifyInstance) {
       return reply.status(500).send({ success: false, error: { code: 'QUERY_FAILED', message: (err as Error).message } });
     }
   });
+
+  // ── 视频生成（OpenAI 兼容异步接口）─
+  // POST /v1/video/generations     → 立即返回 task_id
+  // GET  /v1/video/generations/:id → 查询任务状态
+  // 解决 Cloudflare 100 秒超时问题：避免 MaaS 同步等火山引擎结果
+  app.post('/v1/video/generations', { preHandler: [apiKeyAuth] }, async (request, reply) => {
+    try {
+      const apiKey = await loadApiKey();
+      const body = request.body as any;
+
+      // 选择火山引擎视频模型（默认 Seedance 2.0）
+      const volcanoModel = body.model || 'doubao-seedance-2-0-260128';
+
+      // 构建火山引擎请求体
+      const content: any[] = [{ type: 'text', text: body.prompt || '' }];
+
+      if (body.image) {
+        content.push({ type: 'image_url', image_url: { url: body.image }, role: 'reference_image' });
+      }
+      if (Array.isArray(body.images)) {
+        for (const img of body.images) {
+          content.push({ type: 'image_url', image_url: { url: img }, role: 'reference_image' });
+        }
+      }
+      if (Array.isArray(body.reference_images)) {
+        for (const img of body.reference_images) {
+          content.push({ type: 'image_url', image_url: { url: img }, role: 'reference_image' });
+        }
+      }
+      if (Array.isArray(body.reference_videos)) {
+        for (const vid of body.reference_videos) {
+          content.push({ type: 'video_url', video_url: { url: vid }, role: 'reference_video' });
+        }
+      }
+      if (Array.isArray(body.reference_audios)) {
+        for (const aud of body.reference_audios) {
+          content.push({ type: 'audio_url', audio_url: { url: aud }, role: 'reference_audio' });
+        }
+      }
+
+      const volcanoBody: any = {
+        model: volcanoModel,
+        content,
+        duration: body.duration || 5,
+        ratio: body.ratio || '16:9',
+        watermark: false,
+      };
+      if (body.resolution) volcanoBody.resolution = body.resolution;
+      if (body.generate_audio) volcanoBody.generate_audio = true;
+      if (body.return_last_frame) volcanoBody.return_last_frame = true;
+      if (body.service_tier) volcanoBody.service_tier = body.service_tier;
+      if (body.seed !== undefined && body.seed !== '') volcanoBody.seed = parseInt(body.seed);
+
+      // 调火山引擎创建任务
+      const resp = await fetch(`${VOLCANO_BASE}/contents/generations/tasks`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(volcanoBody),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        return reply.status(resp.status).send({ error: { message: `视频生成请求失败 (${resp.status}): ${errText}` } });
+      }
+
+      const createData = await resp.json() as any;
+      const taskId = createData.id;
+      if (!taskId) {
+        return reply.status(500).send({ error: { message: `任务创建失败: ${JSON.stringify(createData)}` } });
+      }
+
+      // ✅ 立即返回 task_id，不同步等待
+      // 返回格式兼容 OpenAI Video API（带 task_id）
+      return reply.status(200).send({
+        id: taskId,
+        task_id: taskId,
+        status: 'processing',
+        model: volcanoModel,
+        created: Math.floor(Date.now() / 1000),
+      });
+    } catch (err) {
+      return reply.status(500).send({ error: { message: (err as Error).message } });
+    }
+  });
+
+  // 查询视频任务状态（AI Studio 轮询用）
+  app.get('/v1/video/generations/:taskId', { preHandler: [apiKeyAuth] }, async (request, reply) => {
+    try {
+      const apiKey = await loadApiKey();
+      const { taskId } = request.params as { taskId: string };
+
+      const resp = await fetch(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      const taskData = await resp.json() as any;
+
+      // 转换格式为 AI Studio 能识别的形式
+      const status = taskData.status || 'processing';
+      const result: any = {
+        id: taskId,
+        task_id: taskId,
+        status,
+        created: Math.floor(Date.now() / 1000),
+      };
+
+      if (status === 'succeeded') {
+        result.video_url = taskData.content?.video?.url || taskData.content?.video_url;
+        result.last_frame_url = taskData.content?.last_frame_image?.url;
+        result.usage = taskData.usage;
+      }
+
+      if (status === 'failed') {
+        result.error = taskData.error?.message || JSON.stringify(taskData.error || taskData);
+      }
+
+      return reply.status(200).send(result);
+    } catch (err) {
+      return reply.status(500).send({ error: { message: (err as Error).message } });
+    }
+  });
 }
 
 // ── 火山引擎统一调用（根据 modelType 路由到不同端点）──
@@ -226,32 +346,9 @@ async function callVolcanoVideo(apiKey: string, volcanoModel: string, prompt: st
   const taskId = createData.id;
   if (!taskId) throw new Error(`任务创建失败: ${JSON.stringify(createData)}`);
 
-  // 轮询等待（最多10分钟）
-  const taskUrl = `${VOLCANO_BASE}/contents/generations/tasks/${taskId}`;
-  let waited = 0;
-
-  while (waited < 600000) {
-    await sleep(10000);
-    waited += 10000;
-
-    const taskResp = await fetch(taskUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
-    const taskData = await taskResp.json() as any;
-
-    if (taskData.status === 'succeeded') {
-      return {
-        taskId,
-        status: 'succeeded',
-        video_url: taskData.content?.video?.url || taskData.content?.video_url,
-        last_frame: taskData.content?.last_frame_image?.url,
-        usage: taskData.usage,
-      };
-    }
-    if (taskData.status === 'failed') {
-      throw new Error(`任务失败: ${JSON.stringify(taskData.error || taskData)}`);
-    }
-  }
-
-  return { taskId, status: 'processing', message: '任务处理中，可使用 /api/v1/tasks/' + taskId + ' 查询' };
+  // ✅ 异步模式：立即返回 task_id，不阻塞等待
+  // 调用方通过 GET /api/v1/tasks/:taskId 或 GET /v1/video/generations/:taskId 轮询状态
+  return { taskId, status: 'processing', message: '任务已创建，使用 GET /v1/video/generations/' + taskId + ' 查询进度' };
 }
 
 // ===== 图片生成（Seedream）=======================
