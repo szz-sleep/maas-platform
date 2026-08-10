@@ -10,3 +10,4 @@ redis_data/
 minio_data/
 backups/
 logs/
+server/dist/
