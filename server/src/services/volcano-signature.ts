@@ -14,17 +14,17 @@
 import { createHmac, createHash } from 'crypto';
 
 /**
- * 生成 ISO8601 格式的时间戳（UTC）
+ * 生成火山引擎 X-Date 格式的时间戳：YYYYMMDDTHHMMSSZ
  */
 function getTimestamp(): string {
-  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  return new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
 }
 
 /**
  * 生成日期字符串 YYYYMMDD
  */
 function getDate(timestamp: string): string {
-  return timestamp.slice(0, 10).replace(/-/g, '');
+  return timestamp.slice(0, 8);
 }
 
 /**
@@ -43,6 +43,7 @@ function sha256Hex(data: string): string {
 
 /**
  * 签名请求头
+ * 火山引擎签名要求必须包含 x-content-sha256 头
  */
 export function signRequest(
   accessKey: string,
@@ -57,16 +58,24 @@ export function signRequest(
 ): Record<string, string> {
   const timestamp = getTimestamp();
   const date = getDate(timestamp);
+  const hashedPayload = sha256Hex(body || '');
 
-  // 补齐必要头
+  // 补齐必要头（必须包含 content-type, host, x-content-sha256, x-date）
   const signedHeaders: Record<string, string> = {
     'Host': headers['Host'] || 'open.volcengineapi.com',
     'X-Date': timestamp,
+    'X-Content-Sha256': hashedPayload,
     'Content-Type': headers['Content-Type'] || 'application/json',
-    ...headers,
   };
+  // 合并外部传入的头（不覆盖上面4个核心头）
+  for (const k of Object.keys(headers)) {
+    const lower = k.toLowerCase();
+    if (!['host', 'x-date', 'x-content-sha256', 'content-type'].includes(lower)) {
+      signedHeaders[k] = headers[k];
+    }
+  }
 
-  // Canonical Headers（按 key 小写排序，空格压缩值）
+  // Canonical Headers（按 key 小写排序）
   const canonicalHeaders = Object.keys(signedHeaders)
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
     .map(k => `${k.toLowerCase()}:${signedHeaders[k].trim().replace(/\s+/g, ' ')}`)
@@ -77,11 +86,16 @@ export function signRequest(
     .map(k => k.toLowerCase())
     .join(';');
 
-  // Canonical Request
+  // Canonical Query String：按键名排序，值需要 URL 编码
   const canonicalQuery = query
-    ? query.split('&').sort().join('&')
+    ? query.split('&')
+        .map(p => p.split('=', 2))
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v || '')}`)
+        .join('&')
     : '';
-  const hashedPayload = sha256Hex(body || '');
+
+  // Canonical Request
   const canonicalRequest = [
     method.toUpperCase(),
     path,
@@ -101,7 +115,8 @@ export function signRequest(
     sha256Hex(canonicalRequest),
   ].join('\n');
 
-  // Signing Key
+  // Signing Key（HMAC 链：SK → date → region → service → request）
+  // 注意：sk 直接用原始字符串，无需 AWS4 前缀
   const kDate = hmacSha256(Buffer.from(secretKey, 'utf-8'), date);
   const kRegion = hmacSha256(kDate, region);
   const kService = hmacSha256(kRegion, service);
@@ -121,6 +136,7 @@ export function signRequest(
   return {
     'Authorization': authorization,
     'X-Date': timestamp,
+    'X-Content-Sha256': hashedPayload,
     'Content-Type': signedHeaders['Content-Type'] || 'application/json',
     'Host': signedHeaders['Host'],
   };
@@ -163,9 +179,17 @@ export async function signedRequest(
     service, region
   );
 
+  // 构建 fetch headers（排除 Host，fetch 会自动处理）
+  const fetchHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(signedHeaders)) {
+    if (k.toLowerCase() !== 'host') {
+      fetchHeaders[k] = v;
+    }
+  }
+
   return fetch(url, {
     method,
-    headers: signedHeaders,
+    headers: fetchHeaders,
     body: bodyStr || undefined,
   });
 }

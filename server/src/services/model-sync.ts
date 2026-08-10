@@ -1,6 +1,91 @@
 /**
  * 模型同步服务 — 自动检测自部署模型和火山引擎模型并注册到平台
  *
+ * 火山引擎价格映射 — 对齐火山方舟官方定价
+ * - token 计费：元/百万tokens（input/output）
+ * - 按秒计费：元/秒（视频类）
+ * - 按次计费：元/次（图片/3D 类）
+ */
+const VOLCANO_PRICES: Record<string, { inp?: number; out?: number; perSec?: number; perCall?: number }> = {
+  // === 豆包 LLM 系列（元/百万tokens） — 按系列前缀匹配 ===
+  'doubao-lite-4k': { inp: 0.15, out: 0.30 },
+  'doubao-lite-32k': { inp: 0.30, out: 0.80 },
+  'doubao-lite-128k': { inp: 0.30, out: 0.80 },
+  'doubao-lite-256k': { inp: 0.30, out: 0.80 },
+  'doubao-pro-4k': { inp: 0.80, out: 2.00 },
+  'doubao-pro-32k': { inp: 0.80, out: 2.00 },
+  'doubao-pro-128k': { inp: 1.50, out: 6.00 },
+  'doubao-pro-256k': { inp: 1.50, out: 6.00 },
+  'doubao-vision-pro-32k': { inp: 3.00, out: 9.00 },
+  'doubao-pro-1.5-32k': { inp: 5.00, out: 20.00 },
+  // DeepSeek 系列
+  'deepseek-r1': { inp: 4.00, out: 16.00 },
+  'deepseek-v3': { inp: 2.00, out: 8.00 },
+  // === 视频生成 Seedance（元/秒） — 按系列前缀匹配 ===
+  'doubao-seedance-2-0-pro': { perSec: 0.6 },
+  'doubao-seedance-2-0-fast': { perSec: 0.4 },
+  'doubao-seedance-2-0-mini': { perSec: 0.1 },
+  'doubao-seedance-2-5': { perSec: 0.6 },
+  'doubao-seedance-1-5-pro': { perSec: 0.6 },
+  'doubao-seedance-1-0-pro': { perSec: 0.6 },
+  'doubao-seedance-1-0-lite': { perSec: 0.3 },
+  // === 图片生成 Seedream（元/张） — 按系列前缀匹配 ===
+  'doubao-seedream-5-0': { perCall: 0.05 },
+  'doubao-seedream-5-5': { perCall: 0.05 },
+  'doubao-seedream-4-5': { perCall: 0.04 },
+  'doubao-seedream-4-0': { perCall: 0.04 },
+  'doubao-seedream-3-0': { perCall: 0.04 },
+  // === 嵌入模型（元/百万tokens） — 按系列前缀匹配 ===
+  'doubao-embedding-text': { inp: 0.20, out: 0 },
+  'doubao-embedding-large-text': { inp: 0.20, out: 0 },
+  'doubao-embedding-vision': { inp: 0.50, out: 0 },
+  // === 3D 模型（元/次） — 按系列前缀匹配 ===
+  'doubao-seed3d-2-0': { perCall: 0.20 },
+  'doubao-seed3d-1-0': { perCall: 0.20 },
+};
+
+/** 根据火山模型 ID 和类型获取默认价格 */
+function resolvePrice(volcanoModelId: string, modelType: string): {
+  unitCost: number;
+  per1mInputTokens?: number;
+  per1mOutputTokens?: number;
+  unitCostPerSecond?: number;
+} {
+  // 1. 精确匹配
+  const known = VOLCANO_PRICES[volcanoModelId];
+  if (known) {
+    if (known.inp !== undefined || known.out !== undefined) {
+      return { unitCost: 0.01, per1mInputTokens: known.inp ?? 0, per1mOutputTokens: known.out ?? 0 };
+    }
+    if (known.perSec !== undefined) {
+      return { unitCost: known.perSec, unitCostPerSecond: known.perSec };
+    }
+    if (known.perCall !== undefined) {
+      return { unitCost: known.perCall };
+    }
+  }
+  // 2. 前缀匹配（覆盖同一模型的不同版本）
+  for (const [key, price] of Object.entries(VOLCANO_PRICES)) {
+    const prefix = key.replace(/-\d{6,}$/, ''); // 去掉末尾日期版本号
+    if (volcanoModelId.startsWith(prefix)) {
+      if (price.inp !== undefined || price.out !== undefined) {
+        return { unitCost: 0.01, per1mInputTokens: price.inp ?? 0, per1mOutputTokens: price.out ?? 0 };
+      }
+      if (price.perSec !== undefined) {
+        return { unitCost: price.perSec, unitCostPerSecond: price.perSec };
+      }
+      if (price.perCall !== undefined) {
+        return { unitCost: price.perCall };
+      }
+    }
+  }
+  // 3. 按类型给兜底
+  const defaults: Record<string, number> = { video: 0.2, image: 0.04, chat: 0.01, embedding: 0.001, audio: 0.05, '3d': 0.2 };
+  return { unitCost: defaults[modelType] || 0.1 };
+}
+
+/**
+ *
  * 支持的后端：
  *   1. LLM 架构：Ollama、vLLM / OpenAI 兼容端点（chat / embedding）
  *   2. Diffusers 架构：Stable Diffusion WebUI / ComfyUI（image）
@@ -12,7 +97,7 @@
  *   - 管理后台手动触发 API
  *
  * 已注册模型管理：
- *   - 不在检测列表中的 → 标记为 offline
+ *   - 不在检测列表中的 → 删除
  *   - 重新出现的 → 自动恢复 online
  *   - 未变更的 → 保持不变
  */
@@ -343,7 +428,7 @@ export async function syncModels(options?: {
   diffusersEndpoints?: DiffusersEndpoint[];
   includeVolcano?: boolean;
   dryRun?: boolean;
-}): Promise<{ detected: number; registered: number; updated: number; offlined: number }> {
+}): Promise<{ detected: number; registered: number; updated: number; removed: number }> {
   const ollamaEndpoints = options?.ollamaEndpoints?.length ? options.ollamaEndpoints : [];
   const vllmEndpoints = options?.vllmEndpoints || [];
   const diffusersEndpoints = options?.diffusersEndpoints || [];
@@ -379,7 +464,7 @@ export async function syncModels(options?: {
   if (options?.dryRun) {
     console.log(`[model-sync] 干运行：检测到 ${allDetected.length} 个模型`);
     for (const m of allDetected) console.log(`  [${m.source}] ${m.name} (${m.modelType}) — ${m.description}`);
-    return { detected: allDetected.length, registered: 0, updated: 0, offlined: 0 };
+    return { detected: allDetected.length, registered: 0, updated: 0, removed: 0 };
   }
 
   let registered = 0;
@@ -401,23 +486,26 @@ export async function syncModels(options?: {
       loadTime: new Date(),
     };
 
+    // 火山模型的价格从映射表取；自部署模型用默认
+    const price = m.source === 'volcano' && m.volcanoModelId
+      ? resolvePrice(m.volcanoModelId, m.modelType)
+      : { unitCost: { video: 0.2, image: 0.04, chat: 0.01, embedding: 0.001, '3d': 0.2 }[m.modelType] || 0.1 };
+
     if (existing) {
       await prisma.model.update({
         where: { name: m.name },
         data: {
           ...baseData,
-          // ⚠️ 不覆盖 unitCost（管理员可能手动调过价格）
+          ...price,
         },
       });
       updated++;
     } else {
-      // 根据模型类型设默认单价
-      const defaultCost: Record<string, number> = { video: 0.5, image: 0.1, chat: 0.01, embedding: 0.001, audio: 0.05, '3d': 0.3 };
       await prisma.model.create({
         data: {
           name: m.name,
           ...baseData,
-          unitCost: defaultCost[m.modelType] || 0.1,
+          ...price,
           volcanoModelId: m.volcanoModelId,
           volcanoEndpoint: m.volcanoEndpoint,
         },
@@ -426,27 +514,39 @@ export async function syncModels(options?: {
     }
   }
 
-  // 3. 将不在检测列表中的模型标记为 offline
+  // 3. 删除不在检测列表中的模型
+  // 火山模型：没出现在检测列表就删除（火山 API Key 清空后自动消失）
+  // 本地模型：仅在本地服务成功连接且返回了模型列表时才删除；连接失败时保留已有记录
   const allTracked = await prisma.model.findMany({
     where: { source: { in: ['local', 'volcano'] } },
   });
 
-  let offlined = 0;
+  // 判断本地检测是否成功（至少有一条本地模型被检测到，或者没有配置本地端点）
+  const hasLocalEndpoints = ollamaEndpoints.length > 0 || vllmEndpoints.length > 0 || diffusersEndpoints.length > 0;
+  const localDetected = ollamaResults.flat().length + vllmResults.flat().length + diffusersResults.flat().length;
+  const localScanOk = !hasLocalEndpoints || localDetected > 0;
+
+  let removed = 0;
   for (const model of allTracked) {
-    if (!detectedNames.has(model.name) && model.status === 'online') {
-      await prisma.model.update({
-        where: { name: model.name },
-        data: { status: 'offline' },
-      });
-      offlined++;
+    if (detectedNames.has(model.name)) continue;
+
+    if (model.source === 'volcano') {
+      // 火山模型：直接删除
+      await prisma.model.delete({ where: { name: model.name } });
+      removed++;
+    } else if (model.source === 'local' && localScanOk) {
+      // 本地模型：仅当本地服务正常且模型不在列表中时才删除
+      await prisma.model.delete({ where: { name: model.name } });
+      removed++;
     }
+    // 本地服务连接失败时，保留已有的本地模型
   }
 
   console.log(
-    `[model-sync] 同步完成: 检测 ${allDetected.length}, 注册 ${registered}, 更新 ${updated}, 下线 ${offlined}`
+    `[model-sync] 同步完成: 检测 ${allDetected.length}, 注册 ${registered}, 更新 ${updated}, 移除 ${removed}`
   );
 
-  return { detected: allDetected.length, registered, updated, offlined };
+  return { detected: allDetected.length, registered, updated, removed };
 }
 
 // ──────────────────────────────────────────────

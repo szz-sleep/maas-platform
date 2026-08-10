@@ -18,7 +18,7 @@ export default function AdminSidebar() {
   const pathname = usePathname();
 
   return (
-    <nav className="w-56 bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 min-h-[calc(100vh-3.5rem)] sticky top-14">
+    <nav className="w-56 bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 h-full overflow-y-auto shrink-0">
       <div className="p-3 space-y-0.5">
         {links.map((link) => {
           const Icon = link.icon;

@@ -20,6 +20,22 @@ import { generateSchema } from '../utils/validators';
 import { sha256 } from '../utils/apiKey';
 import { loadApiKey } from '../services/volcano';
 
+/**
+ * 计费计算器 — 根据模型类型和实际用量算费
+ */
+function calcCost(model: any, inputTokens?: number, outputTokens?: number, durationSeconds?: number): number {
+  const per1mIn = Number(model.per1mInputTokens || 0);
+  const per1mOut = Number(model.per1mOutputTokens || 0);
+  if ((per1mIn > 0 || per1mOut > 0) && inputTokens !== undefined) {
+    return Number((((inputTokens || 0) / 1_000_000) * per1mIn + ((outputTokens || 0) / 1_000_000) * per1mOut).toFixed(6));
+  }
+  const perSec = Number(model.unitCostPerSecond || 0);
+  if (perSec > 0 && durationSeconds) {
+    return Number((durationSeconds * perSec).toFixed(6));
+  }
+  return Number(model.unitCost || 0.1);
+}
+
 const VOLCANO_BASE = 'https://ark.cn-beijing.volces.com/api/v3';
 
 export default async function generateRoutes(app: FastifyInstance) {
@@ -60,9 +76,10 @@ export default async function generateRoutes(app: FastifyInstance) {
       // 计算用量
       const duration = Date.now() - startTime;
       const usage = result.usage || {};
-      const tokensInput = usage.input_tokens || prompt.length;
-      const tokensOutput = usage.output_tokens || JSON.stringify(result).length;
-      const cost = Number((result.cost || Number(unitCost) || 0.1).toFixed(4));
+      const tokensInput = usage.input_tokens || 0;
+      const tokensOutput = usage.output_tokens || 0;
+      const videoDuration = params.duration || 0; // 视频生成秒数
+      const cost = Number((result.cost || calcCost(modelRecord, tokensInput, tokensOutput, videoDuration)).toFixed(6));
 
       // 扣减配额
       await prisma.apiKey.update({
@@ -136,7 +153,10 @@ export default async function generateRoutes(app: FastifyInstance) {
       const body = request.body as any;
 
       // 选择火山引擎视频模型（默认 Seedance 2.0）
-      const volcanoModel = body.model || 'doubao-seedance-2-0-260128';
+      const volcanoModel = body.model;
+      if (!volcanoModel) {
+        return reply.status(400).send({ success: false, error: { code: 'MODEL_NOT_FOUND', message: '请指定视频模型' } });
+      }
 
       // 构建火山引擎请求体
       const content: any[] = [{ type: 'text', text: body.prompt || '' }];
@@ -250,7 +270,10 @@ export default async function generateRoutes(app: FastifyInstance) {
 // ── 火山引擎统一调用（根据 modelType 路由到不同端点）──
 async function callVolcano(modelType: string, volcanoModelId: string | null, endpoint: string | null, prompt: string, params: any): Promise<any> {
   const apiKey = await loadApiKey();
-  const volcanoModel = volcanoModelId || 'doubao-seed-2-1-pro-260628';
+  const volcanoModel = volcanoModelId;
+  if (!volcanoModel) {
+    throw new Error(`模型 ${volcanoModelId || '(空)'} 未关联火山引擎模型ID`);
+  }
 
   switch (modelType) {
     case 'video': return callVolcanoVideo(apiKey, volcanoModel, prompt, params);

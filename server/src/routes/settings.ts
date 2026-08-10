@@ -108,6 +108,7 @@ function getDescription(key: string): string {
     volcano_api_key: '火山引擎 API Key — 用于视频/图片生成（Seedance/Seedream）',
     volcano_ak: '火山引擎 Access Key — 素材管理签名',
     volcano_sk: '火山引擎 Secret Key — 素材管理签名',
+    volcano_project_name: '项目名称',
     turnstile_site_key: 'Cloudflare Turnstile Site Key — 前端人机验证（公开）',
     turnstile_secret_key: 'Cloudflare Turnstile Secret Key — 后端验证密钥',
     registration_enabled: '是否开放用户注册',

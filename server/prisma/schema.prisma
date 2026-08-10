@@ -21,6 +21,8 @@ model User {
 
   apiKeys       ApiKey[]
   callLogs      CallLog[]
+  assets        Asset[]
+  assetGroups   AssetGroup[]
   quotaHistory  KeyQuotaHistory[] @relation("AllocatedBy")
 
   @@map("users")
@@ -58,7 +60,10 @@ model Model {
   modelType       String    @map("model_type") @db.VarChar(20) // video, image, chat, embedding, audio
   volcanoModelId  String?   @map("volcano_model_id") @db.VarChar(150) // 火山引擎真实模型ID
   volcanoEndpoint String?   @map("volcano_endpoint") @db.VarChar(200) // 火山API端点覆盖
-  unitCost        Decimal   @default(0.1) @map("unit_cost") @db.Decimal(10,4) // 单价
+  unitCost        Decimal   @default(0.1) @map("unit_cost") @db.Decimal(10,6) // 单价（元/次，图片/3D按次，视频按秒时此为兜底价）
+  per1mInputTokens  Decimal? @map("per_1m_input_tokens") @db.Decimal(10,6) // chat类：输入价格（元/百万tokens）
+  per1mOutputTokens Decimal? @map("per_1m_output_tokens") @db.Decimal(10,6) // chat类：输出价格（元/百万tokens）
+  unitCostPerSecond Decimal? @map("unit_cost_per_second") @db.Decimal(10,6) // 视频类：单价（元/秒）
   config          Json?     @db.JsonB // 额外配置（自部署服务地址、参数等）
   status          String    @default("offline") @db.VarChar(20) // online, offline, loading
   isHot           Boolean   @default(false) @map("is_hot")
@@ -112,6 +117,38 @@ model KeyQuotaHistory {
   allocator User?  @relation("AllocatedBy", fields: [allocatedBy], references: [id])
 
   @@map("key_quota_history")
+}
+
+// 素材记录表（用户 ↔ 火山素材库映射）
+model Asset {
+  id           Int       @id @default(autoincrement())
+  userId       Int       @map("user_id")
+  assetName    String    @map("asset_name") @db.VarChar(200)
+  assetType    String    @map("asset_type") @db.VarChar(20) // image, video, audio
+  sourceUrl    String    @map("source_url") @db.Text
+  volcAssetId  String?   @map("volc_asset_id") @unique @db.VarChar(100)
+  volcStatus   String    @default("pending") @map("volc_status") @db.VarChar(30) // pending, processing, active, failed
+  errorMessage String?   @map("error_message") @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([volcStatus])
+  @@map("assets")
+}
+
+// 素材组记录表（按用户自动管理）
+model AssetGroup {
+  id             Int      @id @default(autoincrement())
+  userId         Int      @unique @map("user_id")
+  volcGroupId    String   @map("volc_group_id") @db.VarChar(100)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("asset_groups")
 }
 
 // 系统设置表

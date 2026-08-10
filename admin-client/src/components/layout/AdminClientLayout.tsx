@@ -43,9 +43,9 @@ export default function AdminClientLayout({ children }: { children: React.ReactN
           </button>
         </div>
       </header>
-      <div className="flex">
+      <div className="flex h-[calc(100vh-3.5rem)]">
         <AdminSidebar />
-        <main className="flex-1 p-6 min-h-[calc(100vh-3.5rem)]">
+        <main className="flex-1 p-6 overflow-y-auto">
           {children}
         </main>
       </div>

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { adminApi as api } from '@/lib/api';
-import { Save, Trash2, Eye, EyeOff, Shield, Key, Server } from 'lucide-react';
+import { Save, Trash2, Eye, EyeOff, Shield, Key, Server, UserCog } from 'lucide-react';
 
 interface Setting {
   key: string;
@@ -24,6 +24,7 @@ const SYSTEM_LABELS: Record<string, { label: string; placeholder: string }> = {
   registration_enabled: { label: '开放用户注册', placeholder: 'true 或 false' },
   call_rate_limit: { label: '每分钟最大调用次数', placeholder: '默认 60' },
   token_retention_days: { label: '日志保留天数', placeholder: '默认 365' },
+  volcano_project_name: { label: '项目名称', placeholder: '火山引擎项目名称' },
 };
 
 export default function AdminSettingsPage() {
@@ -34,15 +35,26 @@ export default function AdminSettingsPage() {
   const [showSecret, setShowSecret] = useState<Record<string, boolean>>({});
   const [message, setMessage] = useState('');
 
+  // 管理员账号修改
+  const [adminUsername, setAdminUsername] = useState('');
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [changingPwd, setChangingPwd] = useState(false);
+
   const load = async () => {
+    // 加载配置
     const res = await api.get('/api/v1/admin/settings');
     if (res.success) {
       const data = (res.data as Setting[]) || [];
       setSettings(data);
-      // 初始化编辑值（敏感字段不预填，让用户重新输入）
       const initEdit: Record<string, string> = {};
       data.forEach(s => { if (!s.masked) initEdit[s.key] = s.value || ''; });
       setEditing(initEdit);
+    }
+    // 加载管理员信息
+    const userRes = await api.get('/api/v1/user/profile');
+    if (userRes.success && userRes.data) {
+      setAdminUsername((userRes.data as any).username || '');
     }
     setLoading(false);
   };
@@ -67,6 +79,43 @@ export default function AdminSettingsPage() {
     await api.delete(`/api/v1/admin/settings/${key}`);
     setEditing(prev => ({ ...prev, [key]: '' }));
     load();
+  };
+
+  // 修改管理员密码
+  const handleChangePassword = async () => {
+    if (!oldPassword || !newPassword) {
+      setMessage('❌ 请填写旧密码和新密码');
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    if (newPassword.length < 6) {
+      setMessage('❌ 新密码至少6位');
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    setChangingPwd(true);
+    const res = await api.put('/api/v1/user/password', { oldPassword, newPassword });
+    setChangingPwd(false);
+    if (res.success) {
+      setMessage('✅ 密码修改成功');
+      setOldPassword('');
+      setNewPassword('');
+    } else {
+      setMessage(`❌ ${res.error?.message || '修改失败'}`);
+    }
+    setTimeout(() => setMessage(''), 3000);
+  };
+
+  // 修改管理员用户名
+  const handleChangeUsername = async () => {
+    if (!adminUsername) return;
+    const res = await api.put('/api/v1/user/profile', { username: adminUsername });
+    if (res.success) {
+      setMessage('✅ 用户名已更新');
+    } else {
+      setMessage(`❌ ${res.error?.message || '更新失败'}`);
+    }
+    setTimeout(() => setMessage(''), 3000);
   };
 
   const toggleShow = (key: string) => {
@@ -186,6 +235,53 @@ export default function AdminSettingsPage() {
       <div className="mt-6 p-4 bg-gray-50 dark:bg-gray-800/50 rounded-lg text-xs text-gray-500">
         <p>🔒 所有敏感配置（API Key、AK/SK）均使用 AES-256 加密后存入数据库。</p>
         <p>⚡ 修改后即时生效，无需重启服务。</p>
+      </div>
+
+      {/* 管理员账号 */}
+      <div className="mt-8">
+        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <UserCog size={20} className="text-purple-500" />
+          管理员账号
+        </h2>
+        <div className="bg-white dark:bg-gray-800 rounded-xl p-4 shadow-sm border border-gray-200 dark:border-gray-700 space-y-4">
+          {/* 用户名 */}
+          <div className="flex items-center gap-3">
+            <label className="text-sm font-medium w-20 shrink-0">用户名</label>
+            <input
+              value={adminUsername}
+              onChange={e => setAdminUsername(e.target.value)}
+              className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+            />
+            <button onClick={handleChangeUsername}
+              className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm">
+              保存
+            </button>
+          </div>
+          {/* 密码 */}
+          <div className="flex items-start gap-3">
+            <label className="text-sm font-medium w-20 shrink-0 pt-2">密码</label>
+            <div className="flex-1 flex items-center gap-2">
+              <div className="flex-1 space-y-2">
+                <input
+                  type="password" value={oldPassword}
+                  onChange={e => setOldPassword(e.target.value)}
+                  placeholder="旧密码"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+                <input
+                  type="password" value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  placeholder="新密码（至少6位）"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+              </div>
+              <button onClick={handleChangePassword} disabled={changingPwd}
+                className="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 text-white rounded-lg text-sm shrink-0 self-start">
+                {changingPwd ? '...' : '修改密码'}
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* 其他配置项（动态渲染）*/}

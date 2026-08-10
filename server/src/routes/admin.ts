@@ -244,7 +244,7 @@ export default async function adminRoutes(app: FastifyInstance) {
         diffusersEndpoints: config.sync.diffusersEndpoints,
         includeVolcano: true,
       });
-      return { success: true, data: result, message: `检测 ${result.detected} 个模型，注册 ${result.registered}，更新 ${result.updated}，下线 ${result.offlined}` };
+      return { success: true, data: result, message: `检测 ${result.detected} 个模型，注册 ${result.registered}，更新 ${result.updated}，移除 ${result.removed}` };
     } catch (err) {
       return reply.status(500).send({ success: false, error: { code: 'SYNC_FAILED', message: (err as Error).message } });
     }

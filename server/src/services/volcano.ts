@@ -35,13 +35,14 @@ export async function loadApiKey(): Promise<string> {
 }
 
 /**
- * 从数据库读取并解密 AK/SK 对
+ * 从数据库读取并解密 AK/SK 对和项目名
  * 用于：素材库管理（CreateAsset、GetAsset 等 AK/SK 接口）
  */
-export async function loadAksk(): Promise<{ ak: string; sk: string }> {
-  const [akSetting, skSetting] = await Promise.all([
+export async function loadAksk(): Promise<{ ak: string; sk: string; projectName: string }> {
+  const [akSetting, skSetting, projectSetting] = await Promise.all([
     prisma.systemSetting.findUnique({ where: { key: 'volcano_ak' } }),
     prisma.systemSetting.findUnique({ where: { key: 'volcano_sk' } }),
+    prisma.systemSetting.findUnique({ where: { key: 'volcano_project_name' } }),
   ]);
   if (!akSetting?.value || !skSetting?.value) {
     throw new Error('火山引擎 AK/SK 未配置，请在管理后台「系统配置」中填写');
@@ -49,5 +50,6 @@ export async function loadAksk(): Promise<{ ak: string; sk: string }> {
   return {
     ak: decryptApiKey(akSetting.value),
     sk: decryptApiKey(skSetting.value),
+    projectName: projectSetting?.value || '',
   };
 }

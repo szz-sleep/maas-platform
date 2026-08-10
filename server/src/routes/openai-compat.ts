@@ -20,6 +20,28 @@ import { apiKeyAuth } from '../middleware/auth';
 import { sha256 } from '../utils/apiKey';
 import { loadApiKey } from '../services/volcano';
 
+/**
+ * 计费计算器 — 对齐火山引擎计价方式
+ * - chat/embedding：元/百万tokens（input/output 分别计价）
+ * - video：元/秒（unitCostPerSecond × 时长）
+ * - image/3d：元/次（unitCost）
+ */
+function calcCost(model: any, inputTokens?: number, outputTokens?: number, durationSeconds?: number): number {
+  const per1mIn = Number(model.per1mInputTokens || 0);
+  const per1mOut = Number(model.per1mOutputTokens || 0);
+  // token 计费（chat/embedding）
+  if ((per1mIn > 0 || per1mOut > 0) && inputTokens !== undefined) {
+    return Number((((inputTokens || 0) / 1_000_000) * per1mIn + ((outputTokens || 0) / 1_000_000) * per1mOut).toFixed(6));
+  }
+  // 按秒计费（video）
+  const perSec = Number(model.unitCostPerSecond || 0);
+  if (perSec > 0 && durationSeconds) {
+    return Number((durationSeconds * perSec).toFixed(6));
+  }
+  // 按次计费（image/3d/自部署）
+  return Number(model.unitCost || 0.01);
+}
+
 const VOLCANO_BASE = 'https://ark.cn-beijing.volces.com/api/v3';
 
 export default async function openaiCompatRoutes(app: FastifyInstance) {
@@ -149,7 +171,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
                 }
               }
 
-              // 记录日志
+              // 记录日志（自部署 chat 无 tokens 信息，按次计费）
               const cost = Number(modelRecord.unitCost) || 0.01;
               await prisma.apiKey.update({
                 where: { id: request.apiKeyId },
@@ -196,7 +218,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
                 }
               }
 
-              const cost = Number(modelRecord.unitCost) || 0.01;
+              const cost = calcCost(modelRecord);
               await prisma.apiKey.update({
                 where: { id: request.apiKeyId },
                 data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
@@ -252,7 +274,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
         // 提取回复内容（兼容 Ollama 和 OpenAI 格式）
         const replyText = data.choices?.[0]?.message?.content || data.message?.content || '';
-        const cost = Number(modelRecord.unitCost) || 0.01;
+        const cost = calcCost(modelRecord);
         const duration = Date.now() - startTime;
 
         await prisma.apiKey.update({
@@ -276,7 +298,10 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
       // 火山引擎模型
       const apiKey = await loadApiKey();
-      const volcanoModel = modelRecord.volcanoModelId || 'doubao-seed-2-1-pro-260628';
+      const volcanoModel = modelRecord.volcanoModelId;
+      if (!volcanoModel) {
+        return reply.status(400).send({ error: { message: '模型未关联火山引擎模型ID', type: 'invalid_request_error' } });
+      }
 
       const content: any[] = [];
       for (const msg of messages || []) {
@@ -322,7 +347,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       const outputText = data.output_text || data.output?.[0]?.content?.[0]?.text || '';
       const usage = data.usage || {};
 
-      const cost = Number(modelRecord.unitCost) || 0.1;
+      const cost = calcCost(modelRecord, usage.input_tokens, usage.output_tokens);
       await prisma.apiKey.update({
         where: { id: request.apiKeyId },
         data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
@@ -362,7 +387,10 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     const { prompt, model: modelName, n, size, response_format } = body;
 
     const startTime = Date.now();
-    const modelRecord = await prisma.model.findUnique({ where: { name: modelName || 'seedream5.0-pro' } });
+    if (!modelName) {
+      return reply.status(400).send({ error: { message: '请指定图片模型', type: 'invalid_request_error' } });
+    }
+    const modelRecord = await prisma.model.findUnique({ where: { name: modelName } });
 
     if (!modelRecord || modelRecord.source === 'local' && modelRecord.modelType !== 'image') {
       return reply.status(404).send({ error: { message: `图片生成模型不存在`, type: 'invalid_request_error' } });
@@ -377,7 +405,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
           body: JSON.stringify({ prompt, ...body }),
         });
         const data = await resp.json() as any;
-        const cost = Number(modelRecord.unitCost) || 0.05;
+        const cost = calcCost(modelRecord);
         const duration = Date.now() - startTime;
         await prisma.apiKey.update({ where: { id: request.apiKeyId }, data: { quotaUsed: { increment: cost }, lastUsed: new Date() } });
         await prisma.callLog.create({
@@ -388,7 +416,10 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
       // 火山引擎图片生成
       const apiKey = await loadApiKey();
-      const volcanoModel = modelRecord.volcanoModelId || 'doubao-seedream-5-0-pro-260628';
+      const volcanoModel = modelRecord.volcanoModelId;
+      if (!volcanoModel) {
+        return reply.status(400).send({ error: { message: '模型未关联火山引擎模型ID', type: 'invalid_request_error' } });
+      }
 
       const reqBody: any = {
         model: volcanoModel, prompt, n: n || 1, size: size || '1024x1024',
@@ -404,7 +435,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       const data = (await resp.json()) as any;
       if (!resp.ok) throw new Error(`图片生成失败 (${resp.status}): ${JSON.stringify(data)}`);
 
-      const cost = Number(modelRecord.unitCost) || 0.2;
+      const cost = calcCost(modelRecord);
       await prisma.apiKey.update({
         where: { id: request.apiKeyId },
         data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
@@ -439,7 +470,10 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     const { prompt, model: modelName, image, images, n, size, response_format } = body;
 
     const startTime = Date.now();
-    const modelRecord = await prisma.model.findUnique({ where: { name: modelName || 'seedream5.0-pro' } });
+    if (!modelName) {
+      return reply.status(400).send({ error: { message: '请指定图片模型', type: 'invalid_request_error' } });
+    }
+    const modelRecord = await prisma.model.findUnique({ where: { name: modelName } });
     if (!modelRecord) {
       return reply.status(404).send({ error: { message: `图片生成模型不存在`, type: 'invalid_request_error' } });
     }
@@ -456,7 +490,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
           body: JSON.stringify(reqBody),
         });
         const data = await resp.json() as any;
-        const cost = Number(modelRecord.unitCost) || 0.05;
+        const cost = calcCost(modelRecord);
         const duration = Date.now() - startTime;
         await prisma.apiKey.update({ where: { id: request.apiKeyId }, data: { quotaUsed: { increment: cost }, lastUsed: new Date() } });
         await prisma.callLog.create({
@@ -467,7 +501,10 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
       // 火山引擎图片生成（图生图模式）
       const apiKey = await loadApiKey();
-      const volcanoModel = modelRecord.volcanoModelId || 'doubao-seedream-5-0-pro-260628';
+      const volcanoModel = modelRecord.volcanoModelId;
+      if (!volcanoModel) {
+        return reply.status(400).send({ error: { message: '模型未关联火山引擎模型ID', type: 'invalid_request_error' } });
+      }
 
       const reqBody: any = {
         model: volcanoModel, prompt: prompt || '', n: n || 1, size: size || '1024x1024',
@@ -492,7 +529,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       const data = (await resp.json()) as any;
       if (!resp.ok) throw new Error(`图生图失败 (${resp.status}): ${JSON.stringify(data)}`);
 
-      const cost = Number(modelRecord.unitCost) || 0.2;
+      const cost = calcCost(modelRecord);
       const duration = Date.now() - startTime;
       await prisma.apiKey.update({
         where: { id: request.apiKeyId },
@@ -550,7 +587,7 @@ async function handleSDWebUIImage(
     const data = (await resp.json()) as any;
     if (!resp.ok) throw new Error(`SD WebUI 调用失败 (${resp.status}): ${JSON.stringify(data).substring(0, 200)}`);
 
-    const cost = Number(modelRecord.unitCost) || 0.1;
+    const cost = calcCost(modelRecord);
     const duration = Date.now() - startTime;
 
     await prisma.apiKey.update({
@@ -638,7 +675,7 @@ async function handleComfyUIImage(
         }
 
         if (images.length > 0) {
-          const cost = Number(modelRecord.unitCost) || 0.1;
+          const cost = calcCost(modelRecord);
           const duration = Date.now() - startTime;
           await prisma.apiKey.update({
             where: { id: request.apiKeyId },

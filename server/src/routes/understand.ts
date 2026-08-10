@@ -34,7 +34,10 @@ export default async function understandRoutes(app: FastifyInstance) {
       }
 
       const apiKey = await loadApiKey();
-      const volcanoModel = modelRecord.volcanoModelId || 'doubao-seed-2-1-pro-260628';
+      const volcanoModel = modelRecord.volcanoModelId;
+      if (!volcanoModel) {
+        return reply.status(400).send({ error: { message: '模型未关联火山引擎模型ID', type: 'invalid_request_error' } });
+      }
 
       const content: any[] = [{ type: 'input_text', text: prompt || '请描述这个内容' }];
 
