@@ -187,10 +187,12 @@ export default async function assetRoutes(app: FastifyInstance) {
 
       const data = await resp.json() as any;
 
-      if (resp.ok && data.Response?.Result) {
-        const result = data.Response.Result;
-        const newStatus = result.Status || local.volcStatus;
-        const errorMsg = result.ErrorMessage || null;
+      // 兼容火山返回结构：Result 平级 或 Response.Result 包裹
+      const result = data?.Result || data?.Response?.Result;
+
+      if (resp.ok && result) {
+        const newStatus = (result.Status || local.volcStatus || '').toLowerCase();
+        const errorMsg = result.ErrorMessage || result.ErrorMsg || null;
 
         // 更新本地状态
         await prisma.asset.update({
@@ -203,7 +205,7 @@ export default async function assetRoutes(app: FastifyInstance) {
           data: {
             id: assetId,
             name: result.Name || local.assetName,
-            type: result.AssetType || local.assetType,
+            type: (result.AssetType || local.assetType || '').toLowerCase(),
             url: result.URL || local.sourceUrl,
             status: newStatus,
             errorMessage: errorMsg,
