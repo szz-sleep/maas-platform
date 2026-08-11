@@ -174,15 +174,15 @@ export default async function generateRoutes(app: FastifyInstance) {
           content.push({ type: 'image_url', image_url: { url: img }, role: 'reference_image' });
         }
       }
-      if (Array.isArray(body.reference_videos)) {
-        for (const vid of body.reference_videos) {
-          content.push({ type: 'video_url', video_url: { url: vid }, role: 'reference_video' });
-        }
+      // 视频参考：兼容 videos 与 reference_videos 两种字段名
+      const refVids = Array.isArray(body.videos) ? body.videos : (Array.isArray(body.reference_videos) ? body.reference_videos : []);
+      for (const vid of refVids) {
+        content.push({ type: 'video_url', video_url: { url: vid }, role: 'reference_video' });
       }
-      if (Array.isArray(body.reference_audios)) {
-        for (const aud of body.reference_audios) {
-          content.push({ type: 'audio_url', audio_url: { url: aud }, role: 'reference_audio' });
-        }
+      // 音频参考（用于音色参考）：兼容 audios 与 reference_audios 两种字段名
+      const refAuds = Array.isArray(body.audios) ? body.audios : (Array.isArray(body.reference_audios) ? body.reference_audios : []);
+      for (const aud of refAuds) {
+        content.push({ type: 'audio_url', audio_url: { url: aud }, role: 'reference_audio' });
       }
 
       const volcanoBody: any = {
