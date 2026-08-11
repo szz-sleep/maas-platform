@@ -161,6 +161,14 @@ export default async function generateRoutes(app: FastifyInstance) {
       // 构建火山引擎请求体
       const content: any[] = [{ type: 'text', text: body.prompt || '' }];
 
+      // 首帧/尾帧：Seedance 正确格式是 image_url + role: first_frame / last_frame
+      if (body.first_frame) {
+        content.push({ type: 'image_url', image_url: { url: body.first_frame }, role: 'first_frame' });
+      }
+      if (body.last_frame) {
+        content.push({ type: 'image_url', image_url: { url: body.last_frame }, role: 'last_frame' });
+      }
+
       if (body.image) {
         content.push({ type: 'image_url', image_url: { url: body.image }, role: 'reference_image' });
       }
@@ -331,6 +339,14 @@ async function callLocal(modelRecord: any, prompt: string, params: any): Promise
 // ===== 视频生成（Seedance 2.0）===================
 async function callVolcanoVideo(apiKey: string, volcanoModel: string, prompt: string, params: any): Promise<any> {
   const content: any[] = [{ type: 'text', text: prompt }];
+
+  // 首帧/尾帧：Seedance 用 image_url + role: first_frame / last_frame
+  if (params.first_frame) {
+    content.push({ type: 'image_url', image_url: { url: params.first_frame }, role: 'first_frame' });
+  }
+  if (params.last_frame) {
+    content.push({ type: 'image_url', image_url: { url: params.last_frame }, role: 'last_frame' });
+  }
 
   for (const img of params.images || []) {
     content.push({ type: 'image_url', image_url: { url: img }, role: 'reference_image' });
