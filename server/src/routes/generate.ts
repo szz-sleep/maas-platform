@@ -19,6 +19,45 @@ import { apiKeyAuth } from '../middleware/auth';
 import { generateSchema } from '../utils/validators';
 import { sha256 } from '../utils/apiKey';
 import { loadApiKey } from '../services/volcano';
+import { volcanoSemaphore } from '../services/concurrency';
+import { getRedis } from '../config/redis';
+
+// 信号量排队超时（创建请求流转快，30秒足够）
+const SEMAPHORE_TIMEOUT = 30_000;
+// 各接口 fetch 超时 / 重试
+const FETCH_TIMEOUT = { create: 60_000, query: 30_000, chat: 60_000 };
+const RETRY = { create: 2, query: 2, chat: 2 };
+
+/**
+ * 带超时的 fetch，失败/超时时按 retries 次数重试（指数退避）
+ * @param timeoutMs 单次请求超时
+ * @param retries 额外重试次数
+ */
+async function fetchWithRetry(url: string, init: RequestInit = {}, timeoutMs = 60_000, retries = 2): Promise<Response> {
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const resp = await fetch(url, { ...init, signal: controller.signal });
+      clearTimeout(timer);
+      // 5xx 或 429（限流）才重试；4xx 业务错误不重试
+      if (resp.status >= 500 || resp.status === 429 || resp.status === 408) {
+        if (attempt < retries) {
+          await sleep(500 * Math.pow(2, attempt));
+          continue;
+        }
+      }
+      return resp;
+    } catch (err) {
+      lastErr = err as Error;
+      if (attempt < retries) {
+        await sleep(500 * Math.pow(2, attempt));
+      }
+    }
+  }
+  throw lastErr || new Error('fetch 失败');
+}
 
 /**
  * 计费计算器 — 根据模型类型和实际用量算费
@@ -81,11 +120,15 @@ export default async function generateRoutes(app: FastifyInstance) {
       const videoDuration = params.duration || 0; // 视频生成秒数
       const cost = Number((result.cost || calcCost(modelRecord, tokensInput, tokensOutput, videoDuration)).toFixed(6));
 
-      // 扣减配额
-      await prisma.apiKey.update({
-        where: { id: request.apiKeyId },
-        data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
-      });
+      // 扣减配额（Redis 原子扣减，防并发竞态超额）
+      const quotaDeducted = await atomicDeductQuota(request.apiKeyId, cost);
+      if (!quotaDeducted) {
+        return reply.status(403).send({
+          success: false,
+          error: { code: 'QUOTA_EXHAUSTED', message: '算力额度已用完，请联系管理员充值' },
+          usage: { quotaDeducted: 0 },
+        });
+      }
 
       // 记录调用日志
       await prisma.callLog.create({
@@ -133,9 +176,9 @@ export default async function generateRoutes(app: FastifyInstance) {
     const { taskId } = request.params as { taskId: string };
     try {
       const apiKey = await loadApiKey();
-      const resp = await fetch(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
+      const resp = await fetchWithRetry(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
-      });
+      }, FETCH_TIMEOUT.query, RETRY.query);
       const data = (await resp.json()) as any;
       return { success: true, data: { taskId, status: data.status, result: data.content, usage: data.usage, error: data.error } };
     } catch (err) {
@@ -206,12 +249,22 @@ export default async function generateRoutes(app: FastifyInstance) {
       if (body.service_tier) volcanoBody.service_tier = body.service_tier;
       if (body.seed !== undefined && body.seed !== '') volcanoBody.seed = parseInt(body.seed);
 
-      // 调火山引擎创建任务
-      const resp = await fetch(`${VOLCANO_BASE}/contents/generations/tasks`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(volcanoBody),
-      });
+      // 调火山引擎创建任务（受并发信号量限制：最多5个创建请求同时进行，排队超时30秒）
+      const release = await volcanoSemaphore.acquire(SEMAPHORE_TIMEOUT);
+      if (!release) {
+        return reply.status(503).send({ error: { message: '当前生成任务并发较高，请稍后重试' } });
+      }
+
+      let resp: Response;
+      try {
+        resp = await fetchWithRetry(`${VOLCANO_BASE}/contents/generations/tasks`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(volcanoBody),
+        }, FETCH_TIMEOUT.create, RETRY.create);
+      } finally {
+        release();
+      }
 
       if (!resp.ok) {
         const errText = await resp.text();
@@ -244,9 +297,9 @@ export default async function generateRoutes(app: FastifyInstance) {
       const apiKey = await loadApiKey();
       const { taskId } = request.params as { taskId: string };
 
-      const resp = await fetch(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
+      const resp = await fetchWithRetry(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
-      });
+      }, FETCH_TIMEOUT.query, RETRY.query);
       const taskData = await resp.json() as any;
 
       // 转换格式为 AI Studio 能识别的形式
@@ -370,11 +423,22 @@ async function callVolcanoVideo(apiKey: string, volcanoModel: string, prompt: st
   if (params.return_last_frame) body.return_last_frame = true;
   if (params.service_tier) body.service_tier = params.service_tier;
 
-  const resp = await fetch(`${VOLCANO_BASE}/contents/generations/tasks`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  // 受并发信号量限制：最多5个创建请求同时进行
+  const release = await volcanoSemaphore.acquire(SEMAPHORE_TIMEOUT);
+  if (!release) {
+    throw new Error('当前生成任务并发较高，请稍后重试');
+  }
+
+  let resp: Response;
+  try {
+    resp = await fetchWithRetry(`${VOLCANO_BASE}/contents/generations/tasks`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, FETCH_TIMEOUT.create, RETRY.create);
+  } finally {
+    release();
+  }
 
   if (!resp.ok) {
     const errText = await resp.text();
@@ -402,11 +466,11 @@ async function callVolcanoImage(apiKey: string, volcanoModel: string, prompt: st
     watermark: false,
   };
 
-  const resp = await fetch(`${VOLCANO_BASE}/images/generations`, {
+  const resp = await fetchWithRetry(`${VOLCANO_BASE}/images/generations`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, FETCH_TIMEOUT.create, RETRY.create);
 
   const data = await resp.json() as any;
   if (!resp.ok) {
@@ -433,11 +497,11 @@ async function callVolcanoChat(apiKey: string, volcanoModel: string, prompt: str
   if (params.max_tokens) body.max_output_tokens = params.max_tokens;
   if (params.temperature) body.temperature = params.temperature;
 
-  const resp = await fetch(`${VOLCANO_BASE}/responses`, {
+  const resp = await fetchWithRetry(`${VOLCANO_BASE}/responses`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, FETCH_TIMEOUT.chat, RETRY.chat);
 
   const data = await resp.json() as any;
   if (!resp.ok) {
@@ -447,3 +511,65 @@ async function callVolcanoChat(apiKey: string, volcanoModel: string, prompt: str
 }
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * Redis 原子扣减配额（防并发竞态超额）
+ *
+ * 思路：用 Redis 分布式锁（SET NX EX）把「读DB当前已用 → 判断是否超额 → 扣减写回」
+ *      做成互斥的原子操作，防止同一 key 并发请求同时通过检查导致超额。
+ *      基于 DB 权威值判断（重启不丢），锁只用于串行化并发。
+ * Redis 不可用时降级为普通 DB 扣减（不阻塞业务）。
+ *
+ * @returns true=扣减成功；false=配额不足拒绝
+ */
+async function atomicDeductQuota(apiKeyId: number | undefined, cost: number): Promise<boolean> {
+  if (cost <= 0 || apiKeyId == null) return true;
+
+  try {
+    const redis = getRedis();
+    const lockKey = `quota:lock:${apiKeyId}`;
+    const lockVal = Math.random().toString(36).slice(2);
+    // 获取分布式锁（10秒自动过期兜底）
+    const gotLock = await (redis as any).set(lockKey, lockVal, 'EX', 10, 'NX');
+    if (!gotLock) {
+      // 拿不到锁说明同一 key 正在扣减，等 50ms 后重试（最多5次）
+      for (let i = 0; i < 5; i++) {
+        await sleep(50);
+        const again = await (redis as any).set(lockKey, lockVal, 'EX', 10, 'NX');
+        if (again) break;
+        if (i === 4) return true; // 仍拿不到锁，允许继续（宽松处理，防死锁）
+      }
+    }
+
+    try {
+      // 锁内：读 DB 当前配额 → 判断 → 扣减
+      const keyRec = await prisma.apiKey.findUnique({
+        where: { id: apiKeyId },
+        select: { quotaTotal: true, quotaUsed: true },
+      });
+      const quotaTotal = Number(keyRec?.quotaTotal || 0);
+      const quotaUsed = Number(keyRec?.quotaUsed || 0);
+      if (quotaTotal <= 0) return true;
+      if (quotaUsed + cost > quotaTotal) {
+        return false; // 配额不足
+      }
+      await prisma.apiKey.update({
+        where: { id: apiKeyId },
+        data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+      });
+      return true;
+    } finally {
+      // 释放锁（仅当是自己的锁才删）
+      const lua = `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`;
+      await (redis as any).eval(lua, 1, lockKey, lockVal).catch(() => {});
+    }
+  } catch (err) {
+    // Redis 不可用：降级为普通 DB 扣减，不阻塞业务
+    console.warn('[quota] Redis 扣减失败，降级为 DB 扣减:', (err as Error).message);
+    await prisma.apiKey.update({
+      where: { id: apiKeyId },
+      data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
+    });
+    return true;
+  }
+}

@@ -38,8 +38,8 @@ export const config = {
     vllmEndpoints: parseLabeledEndpoints(process.env.VLLM_ENDPOINTS),
     /** Diffusers 端点，格式: "SD WebUI=http://host:7860@sdwebui,ComfyUI=http://host:8188@comfyui" */
     diffusersEndpoints: parseDiffusersEndpoints(process.env.DIFFUSERS_ENDPOINTS),
-    /** 同步间隔（秒），默认 60 */
-    intervalMs: parseInt(process.env.MODEL_SYNC_INTERVAL || '60', 10) * 1000,
+    /** 同步间隔（秒），默认 3 小时（10800）；避免每 60 秒全量写库拖慢数据库 */
+    intervalMs: parseInt(process.env.MODEL_SYNC_INTERVAL || '10800', 10) * 1000,
   },
 };
 
