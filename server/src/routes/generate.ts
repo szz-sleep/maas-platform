@@ -21,6 +21,14 @@ import { sha256 } from '../utils/apiKey';
 import { loadApiKey } from '../services/volcano';
 import { volcanoSemaphore } from '../services/concurrency';
 import { getRedis } from '../config/redis';
+import {
+  createLocalVideoTask,
+  getLocalVideoContent,
+  getLocalVideoTask,
+  isLocalVideoTaskId,
+  supportsLocalVideoModel,
+  verifyLocalVideoContentSignature,
+} from '../services/video/local-video';
 
 // 信号量排队超时（创建请求流转快，30秒足够）
 const SEMAPHORE_TIMEOUT = 30_000;
@@ -175,6 +183,11 @@ export default async function generateRoutes(app: FastifyInstance) {
   app.get('/api/v1/tasks/:taskId', { preHandler: [apiKeyAuth] }, async (request, reply) => {
     const { taskId } = request.params as { taskId: string };
     try {
+      if (isLocalVideoTaskId(taskId)) {
+        const data = await getLocalVideoTask(taskId, request);
+        return { success: true, data };
+      }
+
       const apiKey = await loadApiKey();
       const resp = await fetchWithRetry(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
@@ -192,14 +205,26 @@ export default async function generateRoutes(app: FastifyInstance) {
   // 解决 Cloudflare 100 秒超时问题：避免 MaaS 同步等火山引擎结果
   app.post('/v1/video/generations', { preHandler: [apiKeyAuth] }, async (request, reply) => {
     try {
-      const apiKey = await loadApiKey();
       const body = request.body as any;
+      const requestedModel = body.model;
 
-      // 选择火山引擎视频模型（默认 Seedance 2.0）
-      const volcanoModel = body.model;
-      if (!volcanoModel) {
+      if (!requestedModel) {
         return reply.status(400).send({ success: false, error: { code: 'MODEL_NOT_FOUND', message: '请指定视频模型' } });
       }
+
+      const modelRecord = await prisma.model.findUnique({ where: { name: requestedModel } });
+      if (modelRecord?.source === 'local' && modelRecord.modelType === 'video') {
+        if (modelRecord.status !== 'online') {
+          return reply.status(503).send({ error: { message: `模型 "${requestedModel}" 当前不可用` } });
+        }
+        if (!supportsLocalVideoModel(modelRecord)) {
+          return reply.status(400).send({ error: { message: `本地视频模型 "${requestedModel}" 未配置受支持的 videoProvider` } });
+        }
+        return reply.status(200).send(await createLocalVideoTask(modelRecord, body));
+      }
+
+      const apiKey = await loadApiKey();
+      const volcanoModel = requestedModel;
 
       // 构建火山引擎请求体
       const content: any[] = [{ type: 'text', text: body.prompt || '' }];
@@ -294,8 +319,13 @@ export default async function generateRoutes(app: FastifyInstance) {
   // 查询视频任务状态（AI Studio 轮询用）
   app.get('/v1/video/generations/:taskId', { preHandler: [apiKeyAuth] }, async (request, reply) => {
     try {
-      const apiKey = await loadApiKey();
       const { taskId } = request.params as { taskId: string };
+
+      if (isLocalVideoTaskId(taskId)) {
+        return reply.status(200).send(await getLocalVideoTask(taskId, request));
+      }
+
+      const apiKey = await loadApiKey();
 
       const resp = await fetchWithRetry(`${VOLCANO_BASE}/contents/generations/tasks/${taskId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
@@ -326,6 +356,33 @@ export default async function generateRoutes(app: FastifyInstance) {
       return reply.status(500).send({ error: { message: (err as Error).message } });
     }
   });
+  // Signed media proxy for local-video results.
+  app.get('/v1/video/generations/:taskId/content', async (request, reply) => {
+    try {
+      const { taskId } = request.params as { taskId: string };
+      const { expires, signature } = request.query as { expires?: string; signature?: string };
+
+      if (!verifyLocalVideoContentSignature(taskId, expires, signature)) {
+        return reply.status(403).send({ error: { message: '视频内容链接无效或已过期' } });
+      }
+
+      const content = await getLocalVideoContent(taskId);
+      if (content.status < 200 || content.status >= 300) {
+        return reply.status(content.status).send({
+          error: { message: `本地视频内容读取失败 (${content.status})` },
+        });
+      }
+
+      reply.header('Content-Type', content.contentType);
+      if (content.contentLength) reply.header('Content-Length', content.contentLength);
+      reply.header('Content-Disposition', 'inline; filename="generated-video.mp4"');
+      reply.header('Cache-Control', 'private, max-age=3600');
+      return reply.send(content.body);
+    } catch (err) {
+      return reply.status(500).send({ error: { message: (err as Error).message } });
+    }
+  });
+
 }
 
 // ── 火山引擎统一调用（根据 modelType 路由到不同端点）──
@@ -349,6 +406,10 @@ async function callVolcano(modelType: string, volcanoModelId: string | null, end
 
 // ── 自部署模型调用（OpenAI 兼容格式）──
 async function callLocal(modelRecord: any, prompt: string, params: any): Promise<any> {
+  if (modelRecord.modelType === 'video' && supportsLocalVideoModel(modelRecord)) {
+    return createLocalVideoTask(modelRecord, { prompt, ...params });
+  }
+
   const baseUrl = modelRecord.config?.endpoint || 'http://localhost:11434/v1';
 
   if (modelRecord.modelType === 'chat') {
