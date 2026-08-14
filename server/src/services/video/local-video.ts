@@ -1,11 +1,15 @@
 /**
  * Generic local-video provider layer.
  *
- * Add future local video backends here rather than expanding generate.ts.
+ * v2:
+ * - public task ids are short UUIDs to avoid Fastify 414 path-param errors
+ * - provider/model/native task mapping is stored in Redis
+ * - legacy lv1_ ids remain readable for rollback/transition compatibility
  */
 
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import prisma from '../../config/database';
+import { getRedis } from '../../config/redis';
 import {
   createMinimaxH3Task,
   getMinimaxH3Content,
@@ -22,7 +26,9 @@ interface LocalTaskEnvelope {
   nativeId: string;
 }
 
-const TASK_PREFIX = 'lv1_';
+const SHORT_TASK_PREFIX = 'lv_';
+const LEGACY_TASK_PREFIX = 'lv1_';
+const REDIS_TASK_KEY_PREFIX = 'maas:local-video:task:';
 
 function configJson(modelRecord: any): Record<string, any> {
   return modelRecord?.config && typeof modelRecord.config === 'object'
@@ -47,23 +53,46 @@ function providerOf(modelRecord: any): LocalVideoProvider | null {
 
 function h3Config(modelRecord: any): MinimaxH3Config {
   const cfg = configJson(modelRecord);
+
   return {
     endpoint: cfg.endpoint,
+    endpointFL2VA: cfg.endpointFL2VA || cfg.endpoint,
+    endpointRef2VA: cfg.endpointRef2VA,
+    ref2vaEnabled: Boolean(cfg.ref2vaEnabled),
     defaults: cfg.defaults || cfg.videoDefaults,
     limits: cfg.limits,
   };
 }
 
-function encodeTask(task: LocalTaskEnvelope): string {
-  return TASK_PREFIX + Buffer.from(JSON.stringify(task), 'utf8').toString('base64url');
+function taskTtlSeconds(): number {
+  const parsed = Number(process.env.LOCAL_VIDEO_TASK_TTL_SECONDS || 604800);
+  if (!Number.isFinite(parsed)) return 604800;
+  return Math.max(3600, Math.trunc(parsed));
 }
 
-function decodeTask(taskId: string): LocalTaskEnvelope | null {
-  if (!taskId.startsWith(TASK_PREFIX)) return null;
+function redisTaskKey(taskId: string): string {
+  return `${REDIS_TASK_KEY_PREFIX}${taskId}`;
+}
+
+function createShortTaskId(): string {
+  return `${SHORT_TASK_PREFIX}${randomUUID()}`;
+}
+
+async function saveTask(taskId: string, task: LocalTaskEnvelope): Promise<void> {
+  await getRedis().set(
+    redisTaskKey(taskId),
+    JSON.stringify(task),
+    'EX',
+    taskTtlSeconds(),
+  );
+}
+
+function decodeLegacyTask(taskId: string): LocalTaskEnvelope | null {
+  if (!taskId.startsWith(LEGACY_TASK_PREFIX)) return null;
 
   try {
     const value = JSON.parse(
-      Buffer.from(taskId.slice(TASK_PREFIX.length), 'base64url').toString('utf8')
+      Buffer.from(taskId.slice(LEGACY_TASK_PREFIX.length), 'base64url').toString('utf8'),
     );
 
     if (
@@ -75,7 +104,37 @@ function decodeTask(taskId: string): LocalTaskEnvelope | null {
       return value as LocalTaskEnvelope;
     }
   } catch {
-    // Not a valid local-video task.
+    // Invalid legacy task id.
+  }
+
+  return null;
+}
+
+async function loadTask(taskId: string): Promise<LocalTaskEnvelope | null> {
+  if (taskId.startsWith(LEGACY_TASK_PREFIX)) {
+    return decodeLegacyTask(taskId);
+  }
+
+  if (!taskId.startsWith(SHORT_TASK_PREFIX)) {
+    return null;
+  }
+
+  const raw = await getRedis().get(redisTaskKey(taskId));
+  if (!raw) return null;
+
+  try {
+    const value = JSON.parse(raw);
+
+    if (
+      value?.v === 1 &&
+      value?.provider === 'minimax-h3' &&
+      typeof value?.model === 'string' &&
+      typeof value?.nativeId === 'string'
+    ) {
+      return value as LocalTaskEnvelope;
+    }
+  } catch {
+    // Invalid Redis task value.
   }
 
   return null;
@@ -117,11 +176,11 @@ function publicBase(request: any): string {
 
   const headers = request?.headers || {};
   const proto = String(
-    headers['x-forwarded-proto'] || request?.protocol || 'http'
+    headers['x-forwarded-proto'] || request?.protocol || 'http',
   ).split(',')[0].trim();
 
   const host = String(
-    headers['x-forwarded-host'] || headers.host || '127.0.0.1:3001'
+    headers['x-forwarded-host'] || headers.host || '127.0.0.1:3001',
   ).split(',')[0].trim();
 
   return `${proto}://${host}`;
@@ -135,7 +194,10 @@ function makeSignature(taskId: string, expires: number): string {
 
 function signedContentUrl(request: any, taskId: string): string {
   const parsedTtl = Number(process.env.VIDEO_PROXY_URL_TTL_SECONDS || 86400);
-  const ttl = Number.isFinite(parsedTtl) ? Math.max(60, Math.trunc(parsedTtl)) : 86400;
+  const ttl = Number.isFinite(parsedTtl)
+    ? Math.max(60, Math.trunc(parsedTtl))
+    : 86400;
+
   const expires = Math.floor(Date.now() / 1000) + ttl;
   const signature = makeSignature(taskId, expires);
 
@@ -147,11 +209,12 @@ export function supportsLocalVideoModel(modelRecord: any): boolean {
 }
 
 export function isLocalVideoTaskId(taskId: string): boolean {
-  return decodeTask(taskId) !== null;
+  return taskId.startsWith(SHORT_TASK_PREFIX) || taskId.startsWith(LEGACY_TASK_PREFIX);
 }
 
 export async function createLocalVideoTask(modelRecord: any, body: any): Promise<any> {
   const provider = providerOf(modelRecord);
+
   if (!provider) {
     throw new Error(`本地视频模型 "${modelRecord?.name || '(unknown)'}" 未配置受支持的 videoProvider`);
   }
@@ -162,7 +225,9 @@ export async function createLocalVideoTask(modelRecord: any, body: any): Promise
 
   if (provider === 'minimax-h3') {
     const created = await createMinimaxH3Task(body, h3Config(modelRecord));
-    const taskId = encodeTask({
+
+    const taskId = createShortTaskId();
+    await saveTask(taskId, {
       v: 1,
       provider,
       model: modelRecord.name,
@@ -186,9 +251,15 @@ export async function createLocalVideoTask(modelRecord: any, body: any): Promise
   throw new Error(`不支持的本地视频 provider: ${provider}`);
 }
 
-async function resolveTask(taskId: string): Promise<{ task: LocalTaskEnvelope; modelRecord: any }> {
-  const task = decodeTask(taskId);
-  if (!task) throw new Error('不是有效的本地视频任务 ID');
+async function resolveTask(taskId: string): Promise<{
+  task: LocalTaskEnvelope;
+  modelRecord: any;
+}> {
+  const task = await loadTask(taskId);
+
+  if (!task) {
+    throw new Error('本地视频任务不存在、已过期或任务 ID 无效');
+  }
 
   const modelRecord = await prisma.model.findUnique({
     where: { name: task.model },
@@ -209,7 +280,11 @@ export async function getLocalVideoTask(taskId: string, request?: any): Promise<
   const { task, modelRecord } = await resolveTask(taskId);
 
   if (task.provider === 'minimax-h3') {
-    const native = await getMinimaxH3Task(task.nativeId, h3Config(modelRecord));
+    const native = await getMinimaxH3Task(
+      task.nativeId,
+      h3Config(modelRecord),
+    );
+
     const normalized = normalizeStatus(native.nativeStatus);
 
     const result: any = {
@@ -238,12 +313,15 @@ export async function getLocalVideoTask(taskId: string, request?: any): Promise<
   throw new Error(`不支持的本地视频 provider: ${task.provider}`);
 }
 
-export function verifyLocalVideoContentSignature(
+export async function verifyLocalVideoContentSignature(
   taskId: string,
   expiresRaw: unknown,
   signatureRaw: unknown,
-): boolean {
-  if (!decodeTask(taskId)) return false;
+): Promise<boolean> {
+  if (!isLocalVideoTaskId(taskId)) return false;
+
+  const task = await loadTask(taskId);
+  if (!task) return false;
 
   const expires = Number(expiresRaw);
   const signature = String(signatureRaw || '');
@@ -268,7 +346,10 @@ export async function getLocalVideoContent(taskId: string) {
   const { task, modelRecord } = await resolveTask(taskId);
 
   if (task.provider === 'minimax-h3') {
-    return getMinimaxH3Content(task.nativeId, h3Config(modelRecord));
+    return getMinimaxH3Content(
+      task.nativeId,
+      h3Config(modelRecord),
+    );
   }
 
   throw new Error(`不支持的本地视频 provider: ${task.provider}`);

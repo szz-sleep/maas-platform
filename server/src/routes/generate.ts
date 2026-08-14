@@ -362,7 +362,7 @@ export default async function generateRoutes(app: FastifyInstance) {
       const { taskId } = request.params as { taskId: string };
       const { expires, signature } = request.query as { expires?: string; signature?: string };
 
-      if (!verifyLocalVideoContentSignature(taskId, expires, signature)) {
+      if (!(await verifyLocalVideoContentSignature(taskId, expires, signature))) {
         return reply.status(403).send({ error: { message: '视频内容链接无效或已过期' } });
       }
 

@@ -186,38 +186,172 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
                 },
               });
             } else {
-              // vLLM OpenAI-compatible stream
+              // vLLM / llama.cpp OpenAI-compatible stream
+              // MAAS_OPENCLAW_STREAM_COMPAT_V3
+              // MAAS_OPENCLAW_TOOL_SCHEMA_COMPAT_V3_1
+              const sanitizeSchemaForLlama = (value: any): any => {
+                if (Array.isArray(value)) {
+                  return value.map((item) => sanitizeSchemaForLlama(item));
+                }
+
+                if (!value || typeof value !== 'object') {
+                  return value;
+                }
+
+                const out: any = {};
+
+                for (const [key, child] of Object.entries(value)) {
+                  if (
+                    key === 'pattern' &&
+                    typeof child === 'string' &&
+                    !(child.startsWith('^') && child.endsWith('$'))
+                  ) {
+                    continue;
+                  }
+
+                  out[key] = sanitizeSchemaForLlama(child);
+                }
+
+                return out;
+              };
+
+              const sanitizedToolsForLlama =
+                body.tools !== undefined
+                  ? sanitizeSchemaForLlama(body.tools)
+                  : undefined;
+
+              const localStreamBody: any = {
+                model: realModelName,
+                messages,
+                stream: true,
+              };
+
+              const passthroughKeys = [
+                'tools',
+                'tool_choice',
+                'parallel_tool_calls',
+                'temperature',
+                'top_p',
+                'max_tokens',
+                'max_completion_tokens',
+                'seed',
+                'stop',
+                'presence_penalty',
+                'frequency_penalty',
+                'response_format',
+                'logit_bias',
+                'n',
+                'user',
+              ];
+
+              for (const key of passthroughKeys) {
+                if (body[key] !== undefined) {
+                  localStreamBody[key] =
+                    key === 'tools' ? sanitizedToolsForLlama : body[key];
+                }
+              }
+
+              for (const key of Object.keys(localStreamBody)) {
+                if (localStreamBody[key] === null) {
+                  delete localStreamBody[key];
+                }
+              }
+
               const vllmResp = await fetch(`${baseUrl}/v1/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: realModelName, messages, max_tokens, temperature, stream: true }),
+                body: JSON.stringify(localStreamBody),
               });
 
               if (!vllmResp.ok || !vllmResp.body) {
-                throw new Error('vLLM stream 请求失败');
+                const upstreamError = await vllmResp.text().catch(() => '');
+                throw new Error(
+                  `vLLM stream 请求失败 (${vllmResp.status}): ${upstreamError.substring(0, 500)}`
+                );
               }
 
               const reader = vllmResp.body.getReader();
               const decoder = new TextDecoder();
               let fullContent = '';
+              let sseBuffer = '';
+
+              const writeOpenAIEvent = (parsed: any) => {
+                const choice = parsed?.choices?.[0];
+                const delta = choice?.delta;
+
+                if (delta && typeof delta === 'object') {
+                  if ('reasoning_content' in delta) {
+                    delete delta.reasoning_content;
+                  }
+
+                  const deltaKeys = Object.keys(delta).filter((k) => {
+                    if (k === 'role' && delta[k] === 'assistant') return false;
+                    return delta[k] !== undefined && delta[k] !== null && delta[k] !== '';
+                  });
+
+                  const hasFinish = choice?.finish_reason !== null &&
+                    choice?.finish_reason !== undefined;
+
+                  if (deltaKeys.length === 0 && !hasFinish) {
+                    return;
+                  }
+
+                  if (typeof delta.content === 'string' && delta.content) {
+                    fullContent += delta.content;
+                  }
+                }
+
+                reply.raw.write(`data: ${JSON.stringify(parsed)}\n\n`);
+              };
+
+              const processSseBlock = (block: string) => {
+                const lines = block.split(/\r?\n/);
+
+                for (const line of lines) {
+                  if (!line.startsWith('data:')) continue;
+
+                  const payload = line.slice(5).trimStart();
+
+                  if (!payload || payload === '[DONE]') {
+                    continue;
+                  }
+
+                  try {
+                    const parsed = JSON.parse(payload);
+                    writeOpenAIEvent(parsed);
+                  } catch {
+                    // best-effort compatibility
+                  }
+                }
+              };
 
               while (true) {
                 const { done, value } = await reader.read();
-                if (done) break;
-                const chunk = decoder.decode(value, { stream: true });
-                const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
-                for (const line of lines) {
-                  try {
-                    const parsed = JSON.parse(line.slice(6));
-                    if (parsed === '[DONE]') continue;
-                    // 直接转发
-                    reply.raw.write(`data: ${JSON.stringify(parsed)}\n\n`);
-                    const delta = parsed.choices?.[0]?.delta?.content || '';
-                    if (delta) fullContent += delta;
-                  } catch { /* skip */ }
+
+                if (done) {
+                  sseBuffer += decoder.decode();
+
+                  if (sseBuffer.trim()) {
+                    processSseBlock(sseBuffer);
+                  }
+
+                  break;
+                }
+
+                sseBuffer += decoder.decode(value, { stream: true });
+
+                while (true) {
+                  const match = /\r?\n\r?\n/.exec(sseBuffer);
+                  if (!match || match.index === undefined) break;
+
+                  const eventBlock = sseBuffer.slice(0, match.index);
+                  sseBuffer = sseBuffer.slice(match.index + match[0].length);
+
+                  if (eventBlock.trim()) {
+                    processSseBlock(eventBlock);
+                  }
                 }
               }
-
               const cost = calcCost(modelRecord);
               await prisma.apiKey.update({
                 where: { id: request.apiKeyId },
@@ -261,7 +395,12 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
           resp = await fetch(`${baseUrl}/v1/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: realModelName, messages, max_tokens, temperature, stream: false }),
+            body: JSON.stringify({
+              ...body,
+              model: realModelName,
+              messages,
+              stream: false,
+            }),
           });
           rawText = await resp.text();
         }
@@ -289,9 +428,26 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
           },
         });
 
+        if (!isOllama && Array.isArray(data.choices)) {
+          return {
+            ...data,
+            model: modelName,
+          };
+        }
+
         return {
-          id: 'chatcmpl-' + Date.now(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: modelName,
-          choices: [{ index: 0, message: { role: 'assistant', content: replyText }, finish_reason: 'stop' }],
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: modelName,
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: replyText,
+            },
+            finish_reason: 'stop',
+          }],
           usage: data.usage || {},
         };
       }
