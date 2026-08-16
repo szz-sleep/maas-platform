@@ -268,7 +268,9 @@ export default async function generateRoutes(app: FastifyInstance) {
         ratio: body.ratio || '16:9',
         watermark: false,
       };
-      if (body.resolution) volcanoBody.resolution = body.resolution;
+      // 分辨率：兼容 resolution 与 size 两种字段（size 为 OpenAI 兼容叫法，火山视频用 resolution）
+      const videoResolution = body.resolution || body.size;
+      if (videoResolution) volcanoBody.resolution = videoResolution;
       if (body.generate_audio) volcanoBody.generate_audio = true;
       if (body.return_last_frame) volcanoBody.return_last_frame = true;
       if (body.service_tier) volcanoBody.service_tier = body.service_tier;
@@ -479,7 +481,9 @@ async function callVolcanoVideo(apiKey: string, volcanoModel: string, prompt: st
     ratio: params.ratio || '16:9',
     watermark: false,
   };
-  if (params.resolution) body.resolution = params.resolution;
+  // 分辨率：兼容 resolution 与 size 两种字段（size 为 OpenAI 兼容叫法，火山视频用 resolution）
+  const videoResolution = params.resolution || params.size;
+  if (videoResolution) body.resolution = videoResolution;
   if (params.generate_audio) body.generate_audio = true;
   if (params.return_last_frame) body.return_last_frame = true;
   if (params.service_tier) body.service_tier = params.service_tier;
