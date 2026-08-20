@@ -26,3 +26,15 @@ export async function connectRedis(): Promise<void> {
     console.warn('⚠️  Redis 连接失败，部分功能（限流/缓存）可能不可用:', (err as Error).message);
   }
 }
+export async function disconnectRedis(): Promise<void> {
+  if (!redis) return;
+
+  const client = redis;
+  redis = null;
+
+  try {
+    await client.quit();
+  } catch {
+    client.disconnect();
+  }
+}

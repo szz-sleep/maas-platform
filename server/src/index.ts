@@ -4,8 +4,9 @@ import multipart from '@fastify/multipart';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { config, validateConfig } from './config';
-import { connectRedis } from './config/redis';
+import { connectRedis, disconnectRedis } from './config/redis';
 import { startModelSyncCron } from './services/model-sync-cron';
+import { startLocalVideoQueueWorker, stopLocalVideoQueueWorker } from './services/video/local-video';
 import authRoutes from './routes/auth';
 import userRoutes from './routes/user';
 import keyRoutes from './routes/key';
@@ -106,14 +107,43 @@ async function main() {
   // 连接 Redis
   await connectRedis();
 
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n🛑 收到 ${signal}，停止领取新的视频任务并关闭 MaaS...`);
+
+    try {
+      await stopLocalVideoQueueWorker();
+      await app.close();
+      await disconnectRedis();
+      console.log('✅ MaaS 已安全停止');
+      process.exit(0);
+    } catch (err) {
+      app.log.error(err);
+      process.exit(1);
+    }
+  };
+
+  process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.once('SIGINT', () => { void shutdown('SIGINT'); });
+
   // 启动服务
   try {
     await app.listen({ port: config.port, host: '0.0.0.0' });
+    startLocalVideoQueueWorker();
+
+    if (typeof process.send === 'function') {
+      process.send('ready');
+    }
+
     console.log(`\n🚀 MaaS 服务已启动: http://localhost:${config.port}`);
     console.log(`📚 API 文档: http://localhost:${config.port}/documentation`);
     console.log(`🏥 健康检查: http://localhost:${config.port}/api/health\n`);
   } catch (err) {
     app.log.error(err);
+    await stopLocalVideoQueueWorker().catch(() => undefined);
+    await disconnectRedis().catch(() => undefined);
     process.exit(1);
   }
 }

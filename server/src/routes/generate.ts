@@ -26,6 +26,8 @@ import {
   getLocalVideoContent,
   getLocalVideoTask,
   isLocalVideoTaskId,
+  localVideoErrorCode,
+  localVideoErrorStatus,
   supportsLocalVideoModel,
   verifyLocalVideoContentSignature,
 } from '../services/video/local-video';
@@ -171,9 +173,9 @@ export default async function generateRoutes(app: FastifyInstance) {
           userAgent: request.headers['user-agent'] || null,
         },
       });
-      return reply.status(500).send({
+      return reply.status(localVideoErrorStatus(err)).send({
         success: false,
-        error: { code: 'GENERATION_FAILED', message: (err as Error).message },
+        error: { code: localVideoErrorCode(err, 'GENERATION_FAILED'), message: (err as Error).message },
         usage: { quotaDeducted: 0 },
       });
     }
@@ -195,7 +197,7 @@ export default async function generateRoutes(app: FastifyInstance) {
       const data = (await resp.json()) as any;
       return { success: true, data: { taskId, status: data.status, result: data.content, usage: data.usage, error: data.error } };
     } catch (err) {
-      return reply.status(500).send({ success: false, error: { code: 'QUERY_FAILED', message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({ success: false, error: { code: localVideoErrorCode(err, 'QUERY_FAILED'), message: (err as Error).message } });
     }
   });
 
@@ -268,9 +270,7 @@ export default async function generateRoutes(app: FastifyInstance) {
         ratio: body.ratio || '16:9',
         watermark: false,
       };
-      // 分辨率：兼容 resolution 与 size 两种字段（size 为 OpenAI 兼容叫法，火山视频用 resolution）
-      const videoResolution = body.resolution || body.size;
-      if (videoResolution) volcanoBody.resolution = videoResolution;
+      if (body.resolution) volcanoBody.resolution = body.resolution;
       if (body.generate_audio) volcanoBody.generate_audio = true;
       if (body.return_last_frame) volcanoBody.return_last_frame = true;
       if (body.service_tier) volcanoBody.service_tier = body.service_tier;
@@ -314,7 +314,12 @@ export default async function generateRoutes(app: FastifyInstance) {
         created: Math.floor(Date.now() / 1000),
       });
     } catch (err) {
-      return reply.status(500).send({ error: { message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({
+        error: {
+          code: localVideoErrorCode(err, 'VIDEO_CREATE_FAILED'),
+          message: (err as Error).message,
+        },
+      });
     }
   });
 
@@ -355,7 +360,12 @@ export default async function generateRoutes(app: FastifyInstance) {
 
       return reply.status(200).send(result);
     } catch (err) {
-      return reply.status(500).send({ error: { message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({
+        error: {
+          code: localVideoErrorCode(err, 'VIDEO_QUERY_FAILED'),
+          message: (err as Error).message,
+        },
+      });
     }
   });
   // Signed media proxy for local-video results.
@@ -381,7 +391,12 @@ export default async function generateRoutes(app: FastifyInstance) {
       reply.header('Cache-Control', 'private, max-age=3600');
       return reply.send(content.body);
     } catch (err) {
-      return reply.status(500).send({ error: { message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({
+        error: {
+          code: localVideoErrorCode(err, 'VIDEO_CONTENT_FAILED'),
+          message: (err as Error).message,
+        },
+      });
     }
   });
 
@@ -481,9 +496,7 @@ async function callVolcanoVideo(apiKey: string, volcanoModel: string, prompt: st
     ratio: params.ratio || '16:9',
     watermark: false,
   };
-  // 分辨率：兼容 resolution 与 size 两种字段（size 为 OpenAI 兼容叫法，火山视频用 resolution）
-  const videoResolution = params.resolution || params.size;
-  if (videoResolution) body.resolution = videoResolution;
+  if (params.resolution) body.resolution = params.resolution;
   if (params.generate_audio) body.generate_audio = true;
   if (params.return_last_frame) body.return_last_frame = true;
   if (params.service_tier) body.service_tier = params.service_tier;
