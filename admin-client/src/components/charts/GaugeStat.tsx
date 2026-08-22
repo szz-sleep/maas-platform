@@ -6,7 +6,7 @@ import { LucideIcon } from 'lucide-react';
 
 interface GaugeStatProps {
   label: string;
-  value: number;
+  value: number | string;   // 支持数字或已格式化(如 toFixed)的字符串
   suffix?: string;
   percent?: number;     // 0-100，用于环进度
   icon: LucideIcon;

@@ -67,7 +67,7 @@ export default function AdminKeysPage() {
     if (selectedKeys.size === 0) { alert('请先勾选要批量配置的 Key'); return; }
     setBatch({ mode:'A', all:[], allKeys:[], selected:new Set(), target:null, loading:true, saving:false });
     const modelRes = await api.get('/api/v1/admin/models/status');
-    setBatch({ mode:'A', all:modelRes.data||[], allKeys:[], selected:new Set(), target:null, loading:false, saving:false });
+    setBatch({ mode:'A', all:(modelRes.data as any[])||[], allKeys:[], selected:new Set(), target:null, loading:false, saving:false });
   };
 
   // ---- 批量 B：按模型批量授权给多个 Key ----
@@ -75,7 +75,7 @@ export default function AdminKeysPage() {
     setBatch({ mode:'B', all:[], allKeys:[], selected:new Set(), target:null, loading:true, saving:false });
     const [modelRes, keysRes] = await Promise.all([api.get('/api/v1/admin/models/status'), api.get('/api/v1/admin/keys?limit=1000')]);
     const allKeys = (keysRes.data as any)?.items || (keysRes.data as any) || [];
-    setBatch({ mode:'B', all:modelRes.data||[], allKeys, selected:new Set(), target:null, loading:false, saving:false });
+    setBatch({ mode:'B', all:(modelRes.data as any[])||[], allKeys, selected:new Set(), target:null, loading:false, saving:false });
   };
 
   const batchToggle = (id: number) => setBatch((p:any)=>{ if(!p)return p; const n=new Set(p.selected); n.has(id)?n.delete(id):n.add(id); return {...p,selected:n}; });
