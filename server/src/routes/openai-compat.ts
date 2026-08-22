@@ -16,9 +16,51 @@
 
 import { FastifyInstance } from 'fastify';
 import prisma from '../config/database';
-import { apiKeyAuth } from '../middleware/auth';
+import { apiKeyAuth, checkKeyModelAllowed, getAllowedModelIds } from '../middleware/auth';
 import { sha256 } from '../utils/apiKey';
-import { loadApiKey } from '../services/volcano';
+import { loadApiKey, loadAksk } from '../services/volcano';
+import { signedRequest } from '../services/volcano-signature';
+import { computeCost } from '../services/pricing';
+
+// 火山 OpenAPI 主机（GetAsset 等素材管理接口）
+const VOLC_HOST = 'open.volcengineapi.com';
+
+/**
+ * 将素材库引用转成火山可下载的真实图片 URL。
+ * Seedream 的 image 字段只接受真实 URL / base64，不接受 asset:// 引用。
+ * 通过火山 GetAsset 接口取回该素材在火山素材库的 URL，保证火山能访问。
+ * @param assetRef - 形如 "asset://<asset_id>" 的引用；非 asset:// 原样返回
+ */
+async function resolveAssetUrl(assetRef: string): Promise<string | null> {
+  if (typeof assetRef !== 'string' || !assetRef.startsWith('asset://')) return assetRef;
+  const assetId = assetRef.slice('asset://'.length);
+  if (!assetId) return null;
+  try {
+    // 调火山 GetAsset 拿真实 URL（权威，火山侧一定可下载；不用本地缓存的 uguu.se 临时图——火山常下载超时）
+    const { ak, sk, projectName } = await loadAksk();
+    const resp = await signedRequest(ak, sk, {
+      method: 'POST',
+      host: VOLC_HOST,
+      path: '/',
+      query: 'Action=GetAsset&Version=2024-01-01',
+      body: { Id: assetId, ProjectName: projectName },
+      service: 'ark',
+    });
+    const data = (await resp.json()) as any;
+    const result = data?.Result || data?.Response?.Result;
+    const url = result?.URL || result?.Url;
+    if (url && typeof url === 'string' && url.startsWith('http')) {
+      return url;
+    }
+    // 火山无结果时回退到本地缓存 URL（仅当是 http 真实图，且非 uguu.se 时优先；uguu.se 可能下载超时但作为最后兜底）
+    const local = await prisma.asset.findUnique({ where: { volcAssetId: assetId } });
+    if (local?.sourceUrl && local.sourceUrl.startsWith('http')) return local.sourceUrl;
+    return null;
+  } catch (e) {
+    console.log('[图片编辑] 解析素材URL失败:', assetId, (e as Error).message);
+    return null;
+  }
+}
 
 /**
  * 计费计算器 — 对齐火山引擎计价方式
@@ -44,11 +86,34 @@ function calcCost(model: any, inputTokens?: number, outputTokens?: number, durat
 
 const VOLCANO_BASE = 'https://ark.cn-beijing.volces.com/api/v3';
 
+/**
+ * 判断图片 size 是否为高像素（>1.5K，即总像素 > 261万）。
+ * 文档：单图生成 ≤261万像素(1.5K及以下) 0.30 元/张；>261万像素(1.5K以上) 0.60 元/张
+ */
+function computePageSize(size?: string): { highPixels: boolean; pixels: number } {
+  let pixels = 0;
+  if (size) {
+    const m = String(size).toLowerCase().match(/(\d+)\s*x\s*(\d+)/);
+    if (m) {
+      pixels = parseInt(m[1]) * parseInt(m[2]);
+    }
+  }
+  return { highPixels: pixels > 2_610_000, pixels };
+}
+
 export default async function openaiCompatRoutes(app: FastifyInstance) {
 
   // ── GET /v1/models — 模型列表（OpenAI 格式）──
   app.get('/v1/models', { preHandler: [apiKeyAuth] }, async (request, reply) => {
-    const models = await prisma.model.findMany({ where: { status: 'online' } });
+    // 按 Key 模型映射过滤：仅返回该 Key 允许的模型；未配置映射 → 空列表
+    const allowed = await getAllowedModelIds(request.apiKeyId!);
+    let where: any = { status: 'online' };
+    if (allowed instanceof Set) {
+      where.id = { in: Array.from(allowed) };
+    } else if (allowed === null) {
+      where.id = { in: [] }; // 未配置映射的 Key 看不到任何模型
+    }
+    const models = await prisma.model.findMany({ where });
     return {
       object: 'list',
       data: models.map((m) => ({
@@ -81,6 +146,14 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
     if (modelRecord.status !== 'online') {
       return reply.status(503).send({
         error: { message: `The model '${modelName}' is currently unavailable`, type: 'server_error', code: 'model_unavailable' },
+      });
+    }
+
+    // Key 模型映射校验
+    const denyReason = await checkKeyModelAllowed(request.apiKeyId, modelRecord.id);
+    if (denyReason) {
+      return reply.status(403).send({
+        error: { message: denyReason, type: 'invalid_request_error', code: 'model_not_allowed' },
       });
     }
 
@@ -502,8 +575,15 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
       const outputText = data.output_text || data.output?.[0]?.content?.[0]?.text || '';
       const usage = data.usage || {};
+      const tin = usage.input_tokens || JSON.stringify(messages).length;
+      const tout = usage.output_tokens || outputText.length;
 
-      const cost = calcCost(modelRecord, usage.input_tokens, usage.output_tokens);
+      // 新计费引擎：按 ModelPrice 标准价计算 + 记录单价/公式
+      const pricing = await computeCost({
+        modelName: modelName, modelType: modelRecord.modelType, source: modelRecord.source,
+        tokensInput: tin, tokensOutput: tout,
+      });
+      const cost = pricing.cost;
       await prisma.apiKey.update({
         where: { id: request.apiKeyId },
         data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
@@ -514,9 +594,9 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
         data: {
           apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
           promptHash: sha256(JSON.stringify(messages)), responseHash: sha256(outputText),
-          tokensInput: usage.input_tokens || JSON.stringify(messages).length,
-          tokensOutput: usage.output_tokens || outputText.length,
+          tokensInput: tin, tokensOutput: tout,
           durationMs: duration, cost, status: 'success',
+          unitInfo: { unit: pricing.unit, weightedUnit: pricing.weightedUnit, formula: pricing.formula, modelType: modelRecord.modelType },
           ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
         },
       });
@@ -550,6 +630,12 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
 
     if (!modelRecord || modelRecord.source === 'local' && modelRecord.modelType !== 'image') {
       return reply.status(404).send({ error: { message: `图片生成模型不存在`, type: 'invalid_request_error' } });
+    }
+
+    // Key 模型映射校验
+    const denyReason = await checkKeyModelAllowed(request.apiKeyId, modelRecord.id);
+    if (denyReason) {
+      return reply.status(403).send({ error: { message: denyReason, type: 'invalid_request_error', code: 'model_not_allowed' } });
     }
 
     try {
@@ -591,7 +677,14 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       const data = (await resp.json()) as any;
       if (!resp.ok) throw new Error(`图片生成失败 (${resp.status}): ${JSON.stringify(data)}`);
 
-      const cost = calcCost(modelRecord);
+      // 图片按张计费（per_image 模式，元/张）
+      const imageCount = Array.isArray(data.data) ? data.data.length : (n || 1);
+      const pagination = computePageSize(size);
+      const pricing = await computeCost({
+        modelName: modelName, modelType: 'image', source: modelRecord.source,
+        imageCount, imageHighPixels: pagination.highPixels,
+      });
+      const cost = pricing.cost;
       await prisma.apiKey.update({
         where: { id: request.apiKeyId },
         data: { quotaUsed: { increment: cost }, lastUsed: new Date() },
@@ -602,6 +695,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
         data: {
           apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
           promptHash: sha256(prompt), durationMs: duration, cost, status: 'success',
+          unitInfo: { unit: pricing.unit, weightedUnit: pricing.weightedUnit, formula: pricing.formula, modelType: 'image', imageCount },
           ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
         },
       });
@@ -634,6 +728,12 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: { message: `图片生成模型不存在`, type: 'invalid_request_error' } });
     }
 
+    // Key 模型映射校验
+    const denyReason = await checkKeyModelAllowed(request.apiKeyId, modelRecord.id);
+    if (denyReason) {
+      return reply.status(403).send({ error: { message: denyReason, type: 'invalid_request_error', code: 'model_not_allowed' } });
+    }
+
     try {
       if (modelRecord.source === 'local') {
         // 自部署模型：img2img
@@ -646,11 +746,15 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
           body: JSON.stringify(reqBody),
         });
         const data = await resp.json() as any;
-        const cost = calcCost(modelRecord);
+        const pricing = await computeCost({
+          modelName: modelName, modelType: 'image', source: modelRecord.source,
+          imageCount: (Array.isArray(data.images) ? data.images.length : 1), imageHighPixels: computePageSize(size).highPixels,
+        });
+        const cost = pricing.cost;
         const duration = Date.now() - startTime;
         await prisma.apiKey.update({ where: { id: request.apiKeyId }, data: { quotaUsed: { increment: cost }, lastUsed: new Date() } });
         await prisma.callLog.create({
-          data: { apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id, promptHash: sha256(prompt), durationMs: duration, cost, status: 'success', ipAddress: request.ip, userAgent: request.headers['user-agent'] || null },
+          data: { apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id, promptHash: sha256(prompt), durationMs: duration, cost, status: 'success', unitInfo: { unit: pricing.unit, weightedUnit: pricing.weightedUnit, formula: pricing.formula, modelType: 'image' }, ipAddress: request.ip, userAgent: request.headers['user-agent'] || null },
         });
         return { created: Math.floor(Date.now() / 1000), data: (data.images || []).map((img: string) => ({ b64_json: img, url: img.startsWith('data:') ? undefined : img })) };
       }
@@ -668,13 +772,19 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       };
 
       // 参考图：优先 images 数组，否则 image 字段
+      // 多图参考：官方文档支持 image 字段传数组（string[]），最多10张
+      // Seedream 的 image 字段只认真实 URL/base64，不认 asset:// → 先把 asset:// 素材转成火山可下载的真实 URL
       if (Array.isArray(images) && images.length > 0) {
-        reqBody.image = image.startsWith('data:') ? image : 'data:image/jpeg;base64,' + images[0];
-        // 多余图片通过 images 字段传（若平台支持）
-        if (images.length > 1) reqBody.images = images.slice(1).map((b: string) => b.startsWith('data:') ? b : 'data:image/jpeg;base64,' + b);
+        const resolved: (string | null)[] = [];
+        for (const img of images) {
+          resolved.push(await resolveAssetUrl(img));
+        }
+        reqBody.image = resolved.filter((v): v is string => !!v);
       } else if (image) {
-        reqBody.image = image.startsWith('data:') ? image : 'data:image/jpeg;base64,' + image;
+        reqBody.image = await resolveAssetUrl(image);
       }
+      // 调试日志：打印实际发给火山的图生图请求体（便于核对多图参考与素材URL解析）
+      console.log('[图片编辑] 请求体:', JSON.stringify(reqBody).substring(0, 2000));
 
       const resp = await fetch(`${VOLCANO_BASE}/images/generations`, {
         method: 'POST',
@@ -683,9 +793,16 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
       });
 
       const data = (await resp.json()) as any;
-      if (!resp.ok) throw new Error(`图生图失败 (${resp.status}): ${JSON.stringify(data)}`);
+      if (!resp.ok) {
+        console.log('[图片编辑] 火山返回错误:', resp.status, JSON.stringify(data).substring(0, 1500));
+        throw new Error(`图生图失败 (${resp.status}): ${JSON.stringify(data)}`);
+      }
 
-      const cost = calcCost(modelRecord);
+      const pricing = await computeCost({
+        modelName: modelName, modelType: 'image', source: modelRecord.source,
+        imageCount: (Array.isArray(data.data) ? data.data.length : (n || 1)), imageHighPixels: computePageSize(size).highPixels,
+      });
+      const cost = pricing.cost;
       const duration = Date.now() - startTime;
       await prisma.apiKey.update({
         where: { id: request.apiKeyId },
@@ -695,6 +812,7 @@ export default async function openaiCompatRoutes(app: FastifyInstance) {
         data: {
           apiKeyId: request.apiKeyId, userId: request.apiKeyUserId, modelId: modelRecord.id,
           promptHash: sha256(prompt), durationMs: duration, cost, status: 'success',
+          unitInfo: { unit: pricing.unit, weightedUnit: pricing.weightedUnit, formula: pricing.formula, modelType: 'image' },
           ipAddress: request.ip, userAgent: request.headers['user-agent'] || null,
         },
       });

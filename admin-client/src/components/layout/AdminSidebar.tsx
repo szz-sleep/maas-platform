@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Users, Key, Box, FileText, BarChart3, Shield, Server, Receipt } from 'lucide-react';
+import { Users, Key, Box, FileText, BarChart3, Shield, Server, Receipt, Tag } from 'lucide-react';
 
 const links = [
   { href: '/admin/overview', label: '大屏总览', icon: BarChart3 },
@@ -11,6 +11,7 @@ const links = [
   { href: '/admin/models', label: '模型管理', icon: Box },
   { href: '/admin/logs', label: '调用日志', icon: FileText },
   { href: '/admin/billing', label: '账单核对', icon: Receipt },
+  { href: '/admin/prices', label: '价格管理', icon: Tag },
   { href: '/admin/settings', label: '系统配置', icon: Shield },
 ];
 

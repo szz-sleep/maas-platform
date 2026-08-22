@@ -4,6 +4,7 @@ dist/
 .env
 .env.local
 *.log
+*.bak
 .DS_Store
 postgres_primary_data/
 redis_data/

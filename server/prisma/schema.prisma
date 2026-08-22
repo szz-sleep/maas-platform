@@ -45,8 +45,23 @@ model ApiKey {
   user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   callLogs     CallLog[]
   quotaHistory KeyQuotaHistory[] @relation("Key")
+  keyModels    KeyModel[]
 
   @@map("api_keys")
+}
+
+// API Key 与模型的多对多映射（管理员为 Key 自定义可用模型）
+model KeyModel {
+  id        Int      @id @default(autoincrement())
+  apiKeyId  Int      @map("api_key_id")
+  modelId   Int      @map("model_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  apiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+  model  Model  @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([apiKeyId, modelId])
+  @@map("key_models")
 }
 
 // 模型定义表
@@ -71,6 +86,7 @@ model Model {
   createdAt       DateTime  @default(now()) @map("created_at")
 
   callLogs CallLog[]
+  keyModels KeyModel[]
 
   @@map("models")
 }
@@ -87,6 +103,7 @@ model CallLog {
   tokensOutput Int?      @map("tokens_output")
   durationMs   Int?      @map("duration_ms")
   cost         Decimal?  @db.Decimal(10,4)
+  unitInfo     Json?     @map("unit_info") @db.JsonB // { unit, weightedUnit, formula, totalTokens, modelType, resolution }
   status       String    @default("success") @db.VarChar(20) // success, failed, timeout
   ipAddress   String?   @map("ip_address") @db.VarChar(45)
   userAgent   String?   @map("user_agent") @db.Text
@@ -101,6 +118,35 @@ model CallLog {
   @@index([createdAt])
   @@index([apiKeyId])
   @@map("call_logs")
+}
+
+// 模型价格表（火山标准价 + 本地参考价，管理端可配置）
+model ModelPrice {
+  id            Int      @id @default(autoincrement())
+  modelKey      String   @unique @db.VarChar(100) // 匹配模型名/别名（如 doubao-seedance-2.0、deepseek-v4-flash正式版）
+  displayName   String?  @map("display_name") @db.VarChar(100)
+  modelType     String   @map("model_type") @db.VarChar(20) // chat, video, image, 3d
+  source        String   @default("volcano") @db.VarChar(20) // volcano, local
+  priceMode     String   @map("price_mode") @db.VarChar(20) // token, per_second, per_image
+  // chat / token 模式：元/百万token
+  inputPrice    Decimal? @map("input_price") @db.Decimal(10,6)
+  outputPrice   Decimal? @map("output_price") @db.Decimal(10,6)
+  cacheHitPrice Decimal? @map("cache_hit_price") @db.Decimal(10,6)
+  // 视频：分辨率档位 + 输入含/不含视频（元/百万token）
+  resolution    String?  @db.VarChar(20) // 480p, 720p, 1080p, 4k
+  inputNoVideo  Decimal? @map("input_no_video") @db.Decimal(10,6)
+  inputWithVideo Decimal? @map("input_with_video") @db.Decimal(10,6)
+  // 视频 per_second 备选（简化计费用）
+  perSecond     Decimal? @map("per_second") @db.Decimal(10,6)
+  // 图片：元/张（低像素==1.5K、高像素>1.5K）
+  perImage      Decimal? @map("per_image") @db.Decimal(10,6)
+  perImageHigh  Decimal? @map("per_image_high") @db.Decimal(10,6)
+  // 本地模型参考的火山模型
+  refModel      String?  @map("ref_model") @db.VarChar(100)
+  remark        String?  @db.Text
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("model_prices")
 }
 
 // Key 配额记录表

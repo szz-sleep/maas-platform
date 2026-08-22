@@ -15,10 +15,11 @@
 
 import { FastifyInstance } from 'fastify';
 import prisma from '../config/database';
-import { apiKeyAuth } from '../middleware/auth';
+import { apiKeyAuth, checkKeyModelAllowed } from '../middleware/auth';
 import { generateSchema } from '../utils/validators';
 import { sha256 } from '../utils/apiKey';
 import { loadApiKey } from '../services/volcano';
+import { computeCost } from '../services/pricing';
 import { volcanoSemaphore } from '../services/concurrency';
 import { getRedis } from '../config/redis';
 import {
@@ -26,6 +27,8 @@ import {
   getLocalVideoContent,
   getLocalVideoTask,
   isLocalVideoTaskId,
+  localVideoErrorCode,
+  localVideoErrorStatus,
   supportsLocalVideoModel,
   verifyLocalVideoContentSignature,
 } from '../services/video/local-video';
@@ -108,6 +111,12 @@ export default async function generateRoutes(app: FastifyInstance) {
       return reply.status(503).send({ success: false, error: { code: 'MODEL_OFFLINE', message: `模型 "${modelName}" 当前不可用` } });
     }
 
+    // Key 模型映射校验
+    const denyReason = await checkKeyModelAllowed(request.apiKeyId, modelRecord.id);
+    if (denyReason) {
+      return reply.status(403).send({ success: false, error: { code: 'MODEL_NOT_ALLOWED', message: denyReason } });
+    }
+
     try {
       let result: any;
       const { source, modelType, volcanoModelId, volcanoEndpoint, unitCost } = modelRecord;
@@ -171,9 +180,9 @@ export default async function generateRoutes(app: FastifyInstance) {
           userAgent: request.headers['user-agent'] || null,
         },
       });
-      return reply.status(500).send({
+      return reply.status(localVideoErrorStatus(err)).send({
         success: false,
-        error: { code: 'GENERATION_FAILED', message: (err as Error).message },
+        error: { code: localVideoErrorCode(err, 'GENERATION_FAILED'), message: (err as Error).message },
         usage: { quotaDeducted: 0 },
       });
     }
@@ -185,6 +194,8 @@ export default async function generateRoutes(app: FastifyInstance) {
     try {
       if (isLocalVideoTaskId(taskId)) {
         const data = await getLocalVideoTask(taskId, request);
+        // 本地视频异步计费
+        await billLocalVideoIfNeeded(taskId, data, request);
         return { success: true, data };
       }
 
@@ -195,7 +206,7 @@ export default async function generateRoutes(app: FastifyInstance) {
       const data = (await resp.json()) as any;
       return { success: true, data: { taskId, status: data.status, result: data.content, usage: data.usage, error: data.error } };
     } catch (err) {
-      return reply.status(500).send({ success: false, error: { code: 'QUERY_FAILED', message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({ success: false, error: { code: localVideoErrorCode(err, 'QUERY_FAILED'), message: (err as Error).message } });
     }
   });
 
@@ -221,6 +232,14 @@ export default async function generateRoutes(app: FastifyInstance) {
           return reply.status(400).send({ error: { message: `本地视频模型 "${requestedModel}" 未配置受支持的 videoProvider` } });
         }
         return reply.status(200).send(await createLocalVideoTask(modelRecord, body));
+      }
+
+      // Key 模型映射校验（仅当模型已在 Model 表中注册时；未注册模型无法映射，放行）
+      if (modelRecord) {
+        const denyReason = await checkKeyModelAllowed(request.apiKeyId, modelRecord.id);
+        if (denyReason) {
+          return reply.status(403).send({ success: false, error: { code: 'MODEL_NOT_ALLOWED', message: denyReason } });
+        }
       }
 
       const apiKey = await loadApiKey();
@@ -268,9 +287,7 @@ export default async function generateRoutes(app: FastifyInstance) {
         ratio: body.ratio || '16:9',
         watermark: false,
       };
-      // 分辨率：兼容 resolution 与 size 两种字段（size 为 OpenAI 兼容叫法，火山视频用 resolution）
-      const videoResolution = body.resolution || body.size;
-      if (videoResolution) volcanoBody.resolution = videoResolution;
+      if (body.resolution) volcanoBody.resolution = body.resolution;
       if (body.generate_audio) volcanoBody.generate_audio = true;
       if (body.return_last_frame) volcanoBody.return_last_frame = true;
       if (body.service_tier) volcanoBody.service_tier = body.service_tier;
@@ -304,6 +321,21 @@ export default async function generateRoutes(app: FastifyInstance) {
         return reply.status(500).send({ error: { message: `任务创建失败: ${JSON.stringify(createData)}` } });
       }
 
+      // 保存任务参数到 Redis（轮询完成时用于准确计费：读分辨率/时长/是否含视频/模型）
+      try {
+        const saveTask = {
+          userId: request.apiKeyUserId, apiKeyId: request.apiKeyId,
+          model: requestedModel,
+          resolution: (body.resolution || '720p').toLowerCase(),
+          duration: body.duration || 5, fps: body.fps || 24,
+          hasInputVideo: (Array.isArray(refVids) && refVids.length > 0),
+        };
+        const redis = getRedis();
+        await redis.set(`video:task:${taskId}`, JSON.stringify(saveTask), 'EX', 3600);
+      } catch (redisErr) {
+        app.log.warn('视频任务参数缓存失败（不影响生成）: ' + (redisErr as Error).message);
+      }
+
       // ✅ 立即返回 task_id，不同步等待
       // 返回格式兼容 OpenAI Video API（带 task_id）
       return reply.status(200).send({
@@ -314,7 +346,12 @@ export default async function generateRoutes(app: FastifyInstance) {
         created: Math.floor(Date.now() / 1000),
       });
     } catch (err) {
-      return reply.status(500).send({ error: { message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({
+        error: {
+          code: localVideoErrorCode(err, 'VIDEO_CREATE_FAILED'),
+          message: (err as Error).message,
+        },
+      });
     }
   });
 
@@ -324,7 +361,10 @@ export default async function generateRoutes(app: FastifyInstance) {
       const { taskId } = request.params as { taskId: string };
 
       if (isLocalVideoTaskId(taskId)) {
-        return reply.status(200).send(await getLocalVideoTask(taskId, request));
+        const localRes = await getLocalVideoTask(taskId, request);
+        // 本地视频异步计费（完成后用估算公式扣费+记日志）
+        await billLocalVideoIfNeeded(taskId, localRes, request);
+        return reply.status(200).send(localRes);
       }
 
       const apiKey = await loadApiKey();
@@ -347,6 +387,8 @@ export default async function generateRoutes(app: FastifyInstance) {
         result.video_url = taskData.content?.video?.url || taskData.content?.video_url;
         result.last_frame_url = taskData.content?.last_frame_image?.url;
         result.usage = taskData.usage;
+        // 异步计费校正：用火山返回的准确 token 用量计费（首次完成时扣费+记日志）
+        await billVideoTaskResult(taskId, taskData, request);
       }
 
       if (status === 'failed') {
@@ -355,7 +397,12 @@ export default async function generateRoutes(app: FastifyInstance) {
 
       return reply.status(200).send(result);
     } catch (err) {
-      return reply.status(500).send({ error: { message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({
+        error: {
+          code: localVideoErrorCode(err, 'VIDEO_QUERY_FAILED'),
+          message: (err as Error).message,
+        },
+      });
     }
   });
   // Signed media proxy for local-video results.
@@ -381,7 +428,12 @@ export default async function generateRoutes(app: FastifyInstance) {
       reply.header('Cache-Control', 'private, max-age=3600');
       return reply.send(content.body);
     } catch (err) {
-      return reply.status(500).send({ error: { message: (err as Error).message } });
+      return reply.status(localVideoErrorStatus(err)).send({
+        error: {
+          code: localVideoErrorCode(err, 'VIDEO_CONTENT_FAILED'),
+          message: (err as Error).message,
+        },
+      });
     }
   });
 
@@ -481,9 +533,7 @@ async function callVolcanoVideo(apiKey: string, volcanoModel: string, prompt: st
     ratio: params.ratio || '16:9',
     watermark: false,
   };
-  // 分辨率：兼容 resolution 与 size 两种字段（size 为 OpenAI 兼容叫法，火山视频用 resolution）
-  const videoResolution = params.resolution || params.size;
-  if (videoResolution) body.resolution = videoResolution;
+  if (params.resolution) body.resolution = params.resolution;
   if (params.generate_audio) body.generate_audio = true;
   if (params.return_last_frame) body.return_last_frame = true;
   if (params.service_tier) body.service_tier = params.service_tier;
@@ -576,6 +626,132 @@ async function callVolcanoChat(apiKey: string, volcanoModel: string, prompt: str
 }
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * 本地视频任务完成后异步计费（方案A-本地版）：
+ * 本地视频用估算 token 公式（无火山 accurate usage）。
+ * Redis SETNX 去重，轮询多次只计费一次。
+ */
+async function billLocalVideoIfNeeded(taskId: string, result: any, request: any): Promise<void> {
+  if (!result || result.status !== 'succeeded') return;
+  try {
+    const redis = getRedis();
+    const billedFlag = await (redis as any).set(`localvideo:billed:${taskId}`, '1', 'EX', 7200, 'NX');
+    if (!billedFlag) return; // 已计费
+
+    const modelName = result.model || taskId;
+    const modelRecord = await prisma.model.findUnique({ where: { name: modelName } });
+    const modelType = modelRecord?.modelType || 'video';
+    const source = modelRecord?.source || 'local';
+
+    // 从 effectiveParams 取时长/分辨率
+    const ep = result.effective_params || result.effectiveParams || {};
+    const durationSec = Number(ep.duration || 5);
+    const resolution = String((ep.resolution || result.resolution || '720p')).toLowerCase();
+    const fps = Number(ep.fps || 24);
+
+    const pricing = await computeCost({
+      modelName,
+      modelType, source,
+      durationSeconds: durationSec,
+      resolution,
+      fps,
+      hasInputVideo: false, // 本地视频无输入视频时长信息，按不含处理
+    });
+    const cost = pricing.cost;
+
+    if (cost > 0 && request?.apiKeyId != null) {
+      await atomicDeductQuota(request.apiKeyId, cost);
+      await prisma.callLog.create({
+        data: {
+          apiKeyId: request.apiKeyId, userId: request.apiKeyUserId,
+          modelId: modelRecord?.id || null,
+          promptHash: sha256(taskId), responseHash: sha256(taskId),
+          tokensInput: 0, tokensOutput: 0,
+          durationMs: Math.round(durationSec * 1000),
+          cost, status: 'success',
+          unitInfo: { unit: pricing.unit, weightedUnit: pricing.weightedUnit, formula: pricing.formula, modelType: 'video', resolution, source: 'local', estimated: true },
+          ipAddress: request?.ip, userAgent: request?.headers?.['user-agent'] || null,
+        },
+      });
+    }
+  } catch (err) {
+    console.error(`[本地视频计费] 任务 ${taskId} 计费失败:`, err);
+  }
+}
+
+/**
+ * 视频任务完成后异步计费（方案A）：
+ * 用火山返回的准确 usage.completion_tokens 计算费用；本视频模型用估算公式。
+ * 通过 Redis SETNX 去重，保证轮询多次只计费一次。
+ */
+async function billVideoTaskResult(taskId: string, taskData: any, request: any): Promise<void> {
+  try {
+    const redis = getRedis();
+    // 幂等去重：同一 taskId 只计费一次
+    const billedFlag = await (redis as any).set(`video:billed:${taskId}`, '1', 'EX', 7200, 'NX');
+    if (!billedFlag) return; // 已计费过
+
+    // 读取创建时缓存的任务参数
+    let meta: any = null;
+    try {
+      const raw = await redis.get(`video:task:${taskId}`);
+      if (raw) meta = JSON.parse(raw);
+    } catch {}
+
+    const modelName = meta?.model || taskId;
+    const resolution = meta?.resolution || '720p';
+    const durationSec = Number(meta?.duration || 5);
+    const fps = Number(meta?.fps || 24);
+    const hasInputVideo = !!meta?.hasInputVideo;
+    const apiKeyId = meta?.apiKeyId ?? request?.apiKeyId;
+    const userId = meta?.userId ?? request?.apiKeyUserId;
+
+    // 查model记录（拿 modelType/source/id）
+    const modelRecord = await prisma.model.findUnique({ where: { name: modelName } });
+    const modelType = modelRecord?.modelType || 'video';
+    const source = modelRecord?.source || 'volcano';
+
+    // 火山准确 token：usage.completion_tokens；若无则用估算公式
+    const volcanoTokens = taskData?.usage?.completion_tokens || taskData?.usage?.total_tokens
+      || taskData?.usage?.output_tokens;
+
+    const pricing = await computeCost({
+      modelName,
+      modelType, source,
+      durationSeconds: durationSec,
+      resolution,
+      fps,
+      hasInputVideo,
+      totalTokensOverride: volcanoTokens, // 火山有准确 token 时覆盖估算值；本地无用估算
+    });
+    const cost = pricing.cost;
+
+    if (cost > 0 && apiKeyId != null) {
+      await atomicDeductQuota(apiKeyId, cost);
+      await prisma.callLog.create({
+        data: {
+          apiKeyId, userId,
+          modelId: modelRecord?.id || null,
+          promptHash: sha256(taskId),
+          responseHash: sha256(taskId),
+          tokensInput: hasInputVideo ? (volcanoTokens || 0) : 0,
+          tokensOutput: volcanoTokens || 0,
+          durationMs: Math.round(durationSec * 1000),
+          cost, status: 'success',
+          unitInfo: {
+            unit: pricing.unit, weightedUnit: pricing.weightedUnit, formula: pricing.formula,
+            modelType: 'video', resolution, hasInputVideo, volcanoTokens: volcanoTokens || null,
+          },
+          ipAddress: request?.ip, userAgent: request?.headers?.['user-agent'] || null,
+        },
+      });
+    }
+  } catch (err) {
+    console.error(`[视频计费] 任务 ${taskId} 计费失败:`, err);
+  }
+}
+
 
 /**
  * Redis 原子扣减配额（防并发竞态超额）

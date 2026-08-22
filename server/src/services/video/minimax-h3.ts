@@ -1,15 +1,51 @@
 /**
- * MiniMax-H3 adapter for vLLM-Omni Videos API.
+ * MiniMax-H3 adapter for the local SGLang Videos API.
  *
- * Runtime v2:
- * - FL2VA endpoint is active
- * - Ref2VA endpoint/config is reserved for future deployment
- * - AI Studio generation parameters are honored where H3 supports them
+ * Current production runtime:
+ * - Ref2VA only
+ * - Uses endpointRef2VA / MINIMAX_H3_ENDPOINT_REF2VA
+ * - T2VA / FL2VA automatic routing is disabled
  */
 
+import prisma from '../../config/database';
+
+
+
+async function resolveH3MaterialUri(uri: string): Promise<string> {
+  const value = String(uri || '').trim();
+
+  if (!value.toLowerCase().startsWith('asset://')) {
+    return value;
+  }
+
+  const assetId = value.slice('asset://'.length).trim();
+
+  if (!assetId) {
+    throw new MinimaxH3RequestError('REFERENCE_ASSET_INVALID', 'MiniMax-H3 收到无效的 asset:// 素材地址', 400);
+  }
+
+  const asset = await prisma.asset.findUnique({
+    where: { volcAssetId: assetId },
+    select: {
+      sourceUrl: true,
+      assetType: true,
+      volcStatus: true,
+    },
+  });
+
+  if (!asset) {
+    throw new MinimaxH3RequestError('REFERENCE_ASSET_NOT_FOUND', `MiniMax-H3 找不到素材: ${assetId}`, 400);
+  }
+
+  if (!asset.sourceUrl) {
+    throw new MinimaxH3RequestError('REFERENCE_ASSET_URL_MISSING', `MiniMax-H3 素材 ${assetId} 没有可用的 sourceUrl`, 400);
+  }
+
+  return asset.sourceUrl;
+}
+
+
 export interface MinimaxH3Config {
-  endpoint?: string;
-  endpointFL2VA?: string;
   endpointRef2VA?: string;
   ref2vaEnabled?: boolean;
   defaults?: {
@@ -37,24 +73,31 @@ export interface MinimaxH3CreatedTask {
   effectiveParams: Record<string, unknown>;
 }
 
+export class MinimaxH3RequestError extends Error {
+  readonly code: string;
+  readonly statusCode: number;
+
+  constructor(code: string, message: string, statusCode = 400) {
+    super(message);
+    this.name = 'MinimaxH3RequestError';
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+export type MinimaxH3MaterialType = 'image' | 'video' | 'audio';
+
+export interface MinimaxH3PreparedTask {
+  requestPayload: Record<string, any>;
+  effectiveParams: Record<string, unknown>;
+}
+
 export interface MinimaxH3TaskStatus {
   nativeId: string;
   nativeStatus: string;
   createdAt?: number;
   progress?: number;
   error?: string;
-}
-
-type H3TaskMode = 't2va' | 'fl2va' | 'ref2va';
-
-function fl2vaEndpoint(config: MinimaxH3Config): string {
-  return String(
-    config.endpointFL2VA ||
-    config.endpoint ||
-    process.env.MINIMAX_H3_ENDPOINT_FL2VA ||
-    process.env.MINIMAX_H3_ENDPOINT ||
-    'http://127.0.0.1:8004'
-  ).replace(/\/+$/, '');
 }
 
 function ref2vaEndpoint(config: MinimaxH3Config): string | null {
@@ -70,17 +113,6 @@ function numberOr(value: unknown, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function firstString(value: unknown): string | undefined {
-  if (typeof value === 'string' && value.trim()) return value.trim();
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      if (typeof item === 'string' && item.trim()) return item.trim();
-    }
-  }
-
-  return undefined;
-}
 
 function normalizeResolution(value: unknown): '720p' | '1080p' {
   const text = String(value || '720p').toLowerCase().trim();
@@ -154,449 +186,557 @@ function parseDataUri(uri: string): { mime: string; bytes: Buffer } {
   const match = uri.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/s);
 
   if (!match) {
-    throw new Error('引用图片 data URI 格式无效');
+    throw new MinimaxH3RequestError(
+      'REFERENCE_DATA_URI_INVALID',
+      '参考素材 data URI 格式无效',
+      400,
+    );
   }
 
   return {
-    mime: match[1] || 'image/jpeg',
+    mime: match[1] || 'application/octet-stream',
     bytes: Buffer.from(match[2], 'base64'),
   };
 }
 
-async function fetchReferenceFile(
-  value: string,
-  config: MinimaxH3Config,
-): Promise<{ blob: Blob; filename: string }> {
-  const timeoutMs = numberOr(
-    config.limits?.mediaFetchTimeoutMs,
-    30_000,
+function materialLabel(type: MinimaxH3MaterialType): string {
+  if (type === 'image') return '参考图片';
+  if (type === 'video') return '参考视频';
+  return '参考音频';
+}
+
+function maxReferenceBytes(config: MinimaxH3Config): number {
+  return Math.max(
+    1,
+    Math.trunc(numberOr(config.limits?.maxReferenceBytes, 25 * 1024 * 1024)),
   );
+}
 
-  const maxBytes = numberOr(
-    config.limits?.maxReferenceBytes,
-    25 * 1024 * 1024,
+function mediaFetchTimeoutMs(config: MinimaxH3Config): number {
+  return Math.max(
+    1000,
+    Math.trunc(numberOr(config.limits?.mediaFetchTimeoutMs, 30_000)),
   );
+}
 
-  if (value.startsWith('data:')) {
-    const parsed = parseDataUri(value);
-
-    if (parsed.bytes.length > maxBytes) {
-      throw new Error(
-        `引用图片超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制`,
-      );
-    }
-
-    const ext = parsed.mime.includes('png')
-      ? 'png'
-      : parsed.mime.includes('webp')
-        ? 'webp'
-        : 'jpg';
-
-    return {
-      blob: new Blob(
-        [new Uint8Array(parsed.bytes)],
-        { type: parsed.mime },
-      ),
-      filename: `reference.${ext}`,
-    };
+function declaredResponseSize(resp: Response): number | null {
+  const contentRange = resp.headers.get('content-range') || '';
+  const rangeMatch = contentRange.match(/\/(\d+)\s*$/);
+  if (rangeMatch) {
+    const total = Number(rangeMatch[1]);
+    if (Number.isFinite(total)) return total;
   }
 
-  if (!/^https?:\/\//i.test(value)) {
-    throw new Error('引用图片仅支持 http(s) URL 或 data URI');
-  }
+  const declared = Number(resp.headers.get('content-length') || 0);
+  return Number.isFinite(declared) && declared > 0 ? declared : null;
+}
 
+function materialHttpError(
+  type: MinimaxH3MaterialType,
+  uri: string,
+  status: number,
+): MinimaxH3RequestError {
+  const label = materialLabel(type);
+  if (status === 404 || status === 410) {
+    return new MinimaxH3RequestError(
+      'REFERENCE_NOT_FOUND',
+      `${label}已失效或不存在，请重新上传素材`,
+      400,
+    );
+  }
+  if (status === 401 || status === 403) {
+    return new MinimaxH3RequestError(
+      'REFERENCE_FORBIDDEN',
+      `${label}无法访问或授权已失效，请重新上传素材`,
+      400,
+    );
+  }
+  return new MinimaxH3RequestError(
+    'REFERENCE_UNREACHABLE',
+    `${label}访问失败 (${status}): ${uri.slice(0, 240)}`,
+    status >= 500 ? 503 : 400,
+  );
+}
+
+async function fetchProbe(
+  uri: string,
+  method: 'HEAD' | 'GET',
+  timeoutMs: number,
+): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs,
-  );
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const resp = await fetch(
-      value,
-      { signal: controller.signal },
-    );
-
-    if (!resp.ok) {
-      throw new Error(`引用图片下载失败 (${resp.status})`);
-    }
-
-    const declared = Number(
-      resp.headers.get('content-length') || 0,
-    );
-
-    if (declared > maxBytes) {
-      throw new Error(
-        `引用图片超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制`,
-      );
-    }
-
-    const bytes = Buffer.from(
-      await resp.arrayBuffer(),
-    );
-
-    if (bytes.length > maxBytes) {
-      throw new Error(
-        `引用图片超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制`,
-      );
-    }
-
-    const mime =
-      resp.headers.get('content-type') ||
-      'image/jpeg';
-
-    const ext = mime.includes('png')
-      ? 'png'
-      : mime.includes('webp')
-        ? 'webp'
-        : 'jpg';
-
-    return {
-      blob: new Blob(
-        [new Uint8Array(bytes)],
-        { type: mime },
-      ),
-      filename: `reference.${ext}`,
+    const headers: Record<string, string> = {
+      Accept: '*/*',
     };
+    if (method === 'GET') {
+      headers.Range = 'bytes=0-0';
+    }
+
+    return await fetch(uri, {
+      method,
+      headers,
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new MinimaxH3RequestError(
+        'REFERENCE_FETCH_TIMEOUT',
+        '参考素材访问超时，请检查素材链接或重新上传',
+        400,
+      );
+    }
+    throw new MinimaxH3RequestError(
+      'REFERENCE_UNREACHABLE',
+      `参考素材无法访问: ${err?.message || err}`,
+      400,
+    );
   } finally {
     clearTimeout(timer);
   }
 }
 
-function extractReferences(body: any) {
-  const firstFrame =
-    firstString(body.first_frame) ||
-    firstString(body.image) ||
-    firstString(body.images) ||
-    firstString(body.reference_images);
+async function probeMaterialUri(
+  uri: string,
+  type: MinimaxH3MaterialType,
+  config: MinimaxH3Config,
+): Promise<void> {
+  const value = String(uri || '').trim();
+  const label = materialLabel(type);
+  const maxBytes = maxReferenceBytes(config);
+  const timeoutMs = mediaFetchTimeoutMs(config);
 
-  const lastFrame =
-    firstString(body.last_frame);
+  if (!value) {
+    throw new MinimaxH3RequestError(
+      'REFERENCE_INVALID',
+      `${label}地址为空`,
+      400,
+    );
+  }
 
-  const videos =
-    Array.isArray(body.videos)
-      ? body.videos
-      : (
-        Array.isArray(body.reference_videos)
-          ? body.reference_videos
-          : []
+  if (value.startsWith('data:')) {
+    const parsed = parseDataUri(value);
+    if (parsed.bytes.length > maxBytes) {
+      throw new MinimaxH3RequestError(
+        'REFERENCE_TOO_LARGE',
+        `${label}超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制`,
+        400,
       );
+    }
+    return;
+  }
 
-  const audios =
-    Array.isArray(body.audios)
-      ? body.audios
-      : (
-        Array.isArray(body.reference_audios)
-          ? body.reference_audios
-          : []
+  if (!/^https?:\/\//i.test(value)) {
+    throw new MinimaxH3RequestError(
+      'REFERENCE_SCHEME_UNSUPPORTED',
+      `${label}仅支持 http(s) URL、data URI 或可解析的 asset:// 地址`,
+      400,
+    );
+  }
+
+  let head: Response | null = null;
+  try {
+    head = await fetchProbe(value, 'HEAD', timeoutMs);
+    if (head.ok) {
+      const declared = declaredResponseSize(head);
+      if (declared !== null && declared > maxBytes) {
+        throw new MinimaxH3RequestError(
+          'REFERENCE_TOO_LARGE',
+          `${label}超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制`,
+          400,
+        );
+      }
+      return;
+    }
+  } finally {
+    if (head?.body) {
+      await head.body.cancel().catch(() => undefined);
+    }
+  }
+
+  // Some temporary-file hosts reject HEAD. Confirm with a one-byte ranged GET
+  // before deciding the material is invalid.
+  let ranged: Response | null = null;
+  try {
+    ranged = await fetchProbe(value, 'GET', timeoutMs);
+    if (!ranged.ok) {
+      throw materialHttpError(type, value, ranged.status);
+    }
+
+    const declared = declaredResponseSize(ranged);
+    if (declared !== null && declared > maxBytes) {
+      throw new MinimaxH3RequestError(
+        'REFERENCE_TOO_LARGE',
+        `${label}超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制`,
+        400,
       );
-
-  return {
-    firstFrame,
-    lastFrame,
-    videos,
-    audios,
-  };
+    }
+  } finally {
+    if (ranged?.body) {
+      await ranged.body.cancel().catch(() => undefined);
+    }
+  }
 }
 
-function detectTaskMode(body: any): H3TaskMode {
-  const refs = extractReferences(body);
+async function probePreparedMaterials(
+  prepared: MinimaxH3PreparedTask,
+  config: MinimaxH3Config,
+): Promise<void> {
+  const conditions = Array.isArray(prepared.requestPayload?.conditions)
+    ? prepared.requestPayload.conditions
+    : [];
 
-  if (
-    refs.videos.length > 0 ||
-    refs.audios.length > 0 ||
-    (
-      Array.isArray(body.reference_images) &&
-      body.reference_images.length > 1
-    )
-  ) {
-    return 'ref2va';
-  }
-
-  if (refs.firstFrame || refs.lastFrame) {
-    return 'fl2va';
-  }
-
-  return 't2va';
+  await Promise.all(conditions.map(async (condition: any) => {
+    const type = String(condition?.type || '') as MinimaxH3MaterialType;
+    if (!['image', 'video', 'audio'].includes(type)) {
+      throw new MinimaxH3RequestError(
+        'REFERENCE_TYPE_INVALID',
+        `MiniMax-H3 收到不支持的参考素材类型: ${String(condition?.type || '')}`,
+        400,
+      );
+    }
+    await probeMaterialUri(String(condition?.uri || ''), type, config);
+  }));
 }
 
 function validateDuration(
   body: any,
   config: MinimaxH3Config,
 ): number {
-  const defaultDuration = numberOr(
-    config.defaults?.duration,
-    4,
-  );
-
-  const duration = numberOr(
-    body.duration ?? body.seconds,
-    defaultDuration,
-  );
-
-  const minDuration = numberOr(
-    config.limits?.minDuration,
-    1,
-  );
-
-  const maxDuration = numberOr(
-    config.limits?.maxDuration,
-    15,
-  );
+  const defaultDuration = numberOr(config.defaults?.duration, 4);
+  const duration = numberOr(body.duration ?? body.seconds, defaultDuration);
+  const minDuration = numberOr(config.limits?.minDuration, 1);
+  const maxDuration = numberOr(config.limits?.maxDuration, 15);
 
   if (duration < minDuration || duration > maxDuration) {
-    throw new Error(
+    throw new MinimaxH3RequestError(
+      'H3_DURATION_INVALID',
       `MiniMax-H3 duration 允许范围为 ${minDuration}~${maxDuration} 秒；收到 ${duration} 秒`,
+      400,
     );
   }
 
   return duration;
 }
 
-function validateSteps(
+export async function prepareMinimaxH3Task(
   body: any,
   config: MinimaxH3Config,
-): number {
-  const defaultSteps = Math.trunc(
-    numberOr(
-      config.defaults?.numInferenceSteps,
-      30,
-    ),
-  );
+): Promise<MinimaxH3PreparedTask> {
+  const prompt = String(body.prompt || '').trim();
 
-  const steps = Math.trunc(
-    numberOr(
-      body.num_inference_steps ??
-      body.numInferenceSteps ??
-      body.steps,
-      defaultSteps,
-    ),
-  );
+  if (!prompt) {
+    throw new MinimaxH3RequestError('H3_PROMPT_REQUIRED', 'MiniMax-H3 需要 prompt', 400);
+  }
 
-  const minSteps = Math.trunc(
-    numberOr(
-      config.limits?.minInferenceSteps,
-      10,
-    ),
-  );
-
-  const maxSteps = Math.trunc(
-    numberOr(
-      config.limits?.maxInferenceSteps,
-      40,
-    ),
-  );
-
-  if (steps < minSteps || steps > maxSteps) {
-    throw new Error(
-      `MiniMax-H3 num_inference_steps 允许范围为 ${minSteps}~${maxSteps}；收到 ${steps}`,
+  const endpoint = ref2vaEndpoint(config);
+  if (!config.ref2vaEnabled || !endpoint) {
+    throw new MinimaxH3RequestError(
+      'H3_REF2VA_DISABLED',
+      'MiniMax-H3 Ref2VA 尚未启用，请配置 ref2vaEnabled=true 和 endpointRef2VA',
+      503,
     );
   }
 
-  return steps;
+  const duration = validateDuration(body, config);
+  const steps = Math.trunc(
+    numberOr(
+      body.num_inference_steps ?? body.numInferenceSteps ?? body.steps,
+      numberOr(config.defaults?.numInferenceSteps, 50),
+    ),
+  );
+
+  if (steps < 10 || steps > 50) {
+    throw new MinimaxH3RequestError(
+      'H3_STEPS_INVALID',
+      `MiniMax-H3 Ref2VA num_inference_steps 允许范围为 10~50；收到 ${steps}`,
+      400,
+    );
+  }
+
+  const flowShift = numberOr(
+    body.flow_shift ?? body.flowShift,
+    numberOr(config.defaults?.flowShift, 12),
+  );
+  const audioFlowShift = numberOr(
+    body.audio_flow_shift ?? body.audioFlowShift,
+    numberOr(config.defaults?.audioFlowShift, 3.0),
+  );
+  let size: ReturnType<typeof resolveSize>;
+  try {
+    size = resolveSize(body, config.defaults?.resolution || '720p');
+  } catch (err) {
+    throw new MinimaxH3RequestError(
+      'H3_SIZE_INVALID',
+      err instanceof Error ? err.message : String(err),
+      400,
+    );
+  }
+
+  const normalizeList = (value: any): string[] => {
+    if (typeof value === 'string' && value.trim()) return [value.trim()];
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((item) => typeof item === 'string' && item.trim())
+      .map((item) => item.trim());
+  };
+  const unique = (items: string[]): string[] => [...new Set(items.filter(Boolean))];
+
+  const rawImageRefs = unique([
+    ...normalizeList(body.reference_images),
+    ...normalizeList(body.images),
+    ...normalizeList(body.image),
+    ...normalizeList(body.first_frame),
+    ...normalizeList(body.last_frame),
+  ]);
+  const rawVideoRefs = unique([
+    ...normalizeList(body.reference_videos),
+    ...normalizeList(body.videos),
+  ]);
+  const rawAudioRefs = unique([
+    ...normalizeList(body.reference_audios),
+    ...normalizeList(body.audios),
+  ]);
+
+  const resolveAll = async (
+    refs: string[],
+    type: MinimaxH3MaterialType,
+  ): Promise<Array<{ type: MinimaxH3MaterialType; uri: string; role: 'reference' }>> => {
+    const resolved = await Promise.all(refs.map(resolveH3MaterialUri));
+    return resolved.map((uri) => ({ type, uri, role: 'reference' as const }));
+  };
+
+  const conditions = [
+    ...(await resolveAll(rawImageRefs, 'image')),
+    ...(await resolveAll(rawVideoRefs, 'video')),
+    ...(await resolveAll(rawAudioRefs, 'audio')),
+  ];
+
+  if (conditions.length === 0) {
+    throw new MinimaxH3RequestError(
+      'H3_REFERENCE_REQUIRED',
+      'MiniMax-H3 Ref2VA 至少需要一个参考图片、参考视频或参考音频',
+      400,
+    );
+  }
+
+  const seed =
+    body.seed !== undefined && body.seed !== ''
+      ? Math.trunc(Number(body.seed))
+      : undefined;
+  if (seed !== undefined && !Number.isFinite(seed)) {
+    throw new MinimaxH3RequestError('H3_SEED_INVALID', 'MiniMax-H3 seed 必须为数字', 400);
+  }
+
+  const shortEdge = Math.min(size.width, size.height);
+  const requestPayload: Record<string, any> = {
+    task: 'ref2va',
+    prompt,
+    conditions,
+    target: {
+      short_edge: shortEdge,
+      aspect_ratio: size.ratio,
+      duration_seconds: duration,
+    },
+    n: 1,
+    num_inference_steps: steps,
+    flow_shift: flowShift,
+    audio_flow_shift: audioFlowShift,
+  };
+  if (seed !== undefined) requestPayload.seed = seed;
+
+  const prepared: MinimaxH3PreparedTask = {
+    requestPayload,
+    effectiveParams: {
+      task: 'ref2va',
+      width: size.width,
+      height: size.height,
+      ratio: size.ratio,
+      resolution: size.resolution,
+      duration,
+      fps: 24,
+      requested_fps:
+        body.fps !== undefined && body.fps !== '' ? Number(body.fps) : undefined,
+      short_edge: shortEdge,
+      num_inference_steps: steps,
+      flow_shift: flowShift,
+      audio_flow_shift: audioFlowShift,
+      image_references: rawImageRefs.length,
+      video_references: rawVideoRefs.length,
+      audio_references: rawAudioRefs.length,
+      queue_limit: 10,
+      seed,
+    },
+  };
+
+  // First probe: reject expired/unreachable materials before a MaaS task is queued.
+  await probePreparedMaterials(prepared, config);
+  return prepared;
+}
+
+export async function submitMinimaxH3PreparedTask(
+  prepared: MinimaxH3PreparedTask,
+  config: MinimaxH3Config,
+  revalidateMaterials = true,
+): Promise<MinimaxH3CreatedTask> {
+  const endpoint = ref2vaEndpoint(config);
+  if (!config.ref2vaEnabled || !endpoint) {
+    throw new MinimaxH3RequestError(
+      'H3_REF2VA_DISABLED',
+      'MiniMax-H3 Ref2VA 尚未启用，请配置 ref2vaEnabled=true 和 endpointRef2VA',
+      503,
+    );
+  }
+
+  // Second probe: temporary URLs may expire while a task waits in the MaaS queue.
+  if (revalidateMaterials) {
+    await probePreparedMaterials(prepared, config);
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  let resp: Response;
+
+  try {
+    resp = await fetch(`${endpoint}/v1/videos`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(prepared.requestPayload),
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new MinimaxH3RequestError(
+        'H3_SUBMIT_TIMEOUT',
+        'MiniMax-H3 任务提交超时',
+        503,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const responseText = await resp.text();
+  let data: any;
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    data = { raw: responseText };
+  }
+
+  if (!resp.ok) {
+    throw new MinimaxH3RequestError(
+      'H3_CREATE_FAILED',
+      `MiniMax-H3 Ref2VA 创建任务失败 (${resp.status}): ${responseText.slice(0, 1200)}`,
+      resp.status >= 500 ? 503 : 400,
+    );
+  }
+
+  if (!data?.id) {
+    throw new MinimaxH3RequestError(
+      'H3_TASK_ID_MISSING',
+      `MiniMax-H3 Ref2VA 未返回任务 ID: ${responseText.slice(0, 1200)}`,
+      502,
+    );
+  }
+
+  return {
+    nativeId: String(data.id),
+    nativeStatus: String(data.status || 'queued'),
+    createdAt: data.created_at,
+    effectiveParams: prepared.effectiveParams,
+  };
 }
 
 export async function createMinimaxH3Task(
   body: any,
   config: MinimaxH3Config,
 ): Promise<MinimaxH3CreatedTask> {
-  const prompt = String(body.prompt || '').trim();
+  const prepared = await prepareMinimaxH3Task(body, config);
+  return submitMinimaxH3PreparedTask(prepared, config, false);
+}
 
-  if (!prompt) {
-    throw new Error('MiniMax-H3 需要 prompt');
+export async function getMinimaxH3ActiveTaskCount(
+  config: MinimaxH3Config,
+): Promise<number> {
+  const endpoint = ref2vaEndpoint(config);
+  if (!endpoint) {
+    throw new MinimaxH3RequestError('H3_ENDPOINT_MISSING', 'MiniMax-H3 Ref2VA endpoint 未配置', 503);
   }
-
-  const taskMode = detectTaskMode(body);
-  const refs = extractReferences(body);
-
-  if (taskMode === 'ref2va') {
-    const endpoint = ref2vaEndpoint(config);
-
-    if (!config.ref2vaEnabled || !endpoint) {
-      throw new Error(
-        'MiniMax-H3 Ref2VA 接口已预留，但当前服务器尚未部署/启用 Ref2VA endpoint',
-      );
-    }
-
-    // Intentionally reserved until Ref2VA deployment is verified.
-    throw new Error(
-      'MiniMax-H3 Ref2VA endpoint 已配置，但当前 MaaS 版本仅预留路由接口，尚未启用 Ref2VA 请求体适配',
-    );
-  }
-
-  if (refs.lastFrame) {
-    throw new Error(
-      '当前 MiniMax-H3 FL2VA 服务暂不开放尾帧控制',
-    );
-  }
-
-  const duration =
-    validateDuration(body, config);
-
-  const fps = Math.trunc(
-    numberOr(
-      body.fps,
-      numberOr(config.defaults?.fps, 24),
-    ),
-  );
-
-  // Current H3 output pipeline is fixed at 24fps.
-  if (fps !== 24) {
-    throw new Error(
-      `当前 MiniMax-H3 部署仅支持 24 FPS；收到 ${fps}`,
-    );
-  }
-
-  const steps =
-    validateSteps(body, config);
-
-  const flowShift = numberOr(
-    body.flow_shift ?? body.flowShift,
-    numberOr(config.defaults?.flowShift, 12),
-  );
-
-  const audioFlowShift = numberOr(
-    body.audio_flow_shift ?? body.audioFlowShift,
-    numberOr(config.defaults?.audioFlowShift, 3.0),
-  );
-
-  const size = resolveSize(
-    body,
-    config.defaults?.resolution || '720p',
-  );
-
-  const form = new FormData();
-
-  form.append('prompt', prompt);
-  form.append('width', String(size.width));
-  form.append('height', String(size.height));
-  form.append('fps', String(fps));
-  form.append(
-    'num_inference_steps',
-    String(steps),
-  );
-  form.append(
-    'flow_shift',
-    String(flowShift),
-  );
-
-  if (
-    body.seed !== undefined &&
-    body.seed !== ''
-  ) {
-    const seed = Number(body.seed);
-
-    if (!Number.isFinite(seed)) {
-      throw new Error('MiniMax-H3 seed 必须为数字');
-    }
-
-    form.append(
-      'seed',
-      String(Math.trunc(seed)),
-    );
-  }
-
-  const extraParams: Record<string, unknown> = {
-    task: taskMode,
-    duration,
-    audio_flow_shift: audioFlowShift,
-  };
-
-  if (refs.firstFrame) {
-    const first = await fetchReferenceFile(
-      refs.firstFrame,
-      config,
-    );
-
-    form.append(
-      'input_reference',
-      first.blob,
-      first.filename,
-    );
-  }
-
-  form.append(
-    'extra_params',
-    JSON.stringify(extraParams),
-  );
 
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    60_000,
-  );
-
-  let resp: Response;
-
+  const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    resp = await fetch(
-      `${fl2vaEndpoint(config)}/v1/videos`,
-      {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-        },
-        body: form,
-        signal: controller.signal,
-      },
+    const resp = await fetch(`${endpoint}/v1/videos?limit=100`, {
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data: any = await resp.json();
+    const jobs = Array.isArray(data?.data) ? data.data : [];
+    return jobs.filter((job: any) => {
+      const status = String(job?.status || '').toLowerCase();
+      return ['queued', 'pending', 'processing', 'running', 'in_progress', 'in-progress'].includes(status);
+    }).length;
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new MinimaxH3RequestError('H3_QUEUE_QUERY_TIMEOUT', 'MiniMax-H3 队列状态查询超时', 503);
+    }
+    throw new MinimaxH3RequestError(
+      'H3_QUEUE_QUERY_FAILED',
+      `MiniMax-H3 队列状态查询失败: ${err?.message || err}`,
+      503,
     );
   } finally {
     clearTimeout(timer);
   }
-
-  const text = await resp.text();
-  let data: any;
-
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
-
-  if (!resp.ok) {
-    throw new Error(
-      `MiniMax-H3 创建任务失败 (${resp.status}): ${text.slice(0, 1200)}`,
-    );
-  }
-
-  if (!data?.id) {
-    throw new Error(
-      `MiniMax-H3 未返回任务 ID: ${text.slice(0, 1200)}`,
-    );
-  }
-
-  return {
-    nativeId: String(data.id),
-    nativeStatus: String(
-      data.status || 'queued',
-    ),
-    createdAt: data.created_at,
-    effectiveParams: {
-      task: taskMode,
-      width: size.width,
-      height: size.height,
-      ratio: size.ratio,
-      resolution: size.resolution,
-      duration,
-      fps,
-      num_inference_steps: steps,
-      flow_shift: flowShift,
-      audio_flow_shift: audioFlowShift,
-      seed:
-        body.seed !== undefined &&
-        body.seed !== ''
-          ? Math.trunc(Number(body.seed))
-          : undefined,
-    },
-  };
 }
+
+export async function deleteMinimaxH3Task(
+  nativeId: string,
+  config: MinimaxH3Config,
+): Promise<void> {
+  const endpoint = ref2vaEndpoint(config);
+  if (!endpoint) return;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const resp = await fetch(`${endpoint}/v1/videos/${encodeURIComponent(nativeId)}`, {
+      method: 'DELETE',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (!resp.ok && resp.status !== 404) {
+      const text = await resp.text();
+      throw new Error(`MiniMax-H3 删除任务记录失败 (${resp.status}): ${text.slice(0, 600)}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 export async function getMinimaxH3Task(
   nativeId: string,
   config: MinimaxH3Config,
 ): Promise<MinimaxH3TaskStatus> {
+  const endpoint = ref2vaEndpoint(config);
+
+  if (!endpoint) {
+    throw new Error('MiniMax-H3 Ref2VA endpoint 未配置');
+  }
+
   const resp = await fetch(
-    `${fl2vaEndpoint(config)}/v1/videos/${encodeURIComponent(nativeId)}`,
+    `${endpoint}/v1/videos/${encodeURIComponent(nativeId)}`,
     {
       headers: {
         Accept: 'application/json',
@@ -614,6 +754,18 @@ export async function getMinimaxH3Task(
   }
 
   if (!resp.ok) {
+    if (
+      resp.status === 404 &&
+      String(data?.detail || '').toLowerCase().includes('video not found')
+    ) {
+      return {
+        nativeId,
+        nativeStatus: 'processing',
+        progress: undefined,
+        error: undefined,
+      };
+    }
+
     throw new Error(
       `MiniMax-H3 查询任务失败 (${resp.status}): ${text.slice(0, 1200)}`,
     );
@@ -650,8 +802,14 @@ export async function getMinimaxH3Content(
   contentLength?: string;
   body: Buffer;
 }> {
+  const endpoint = ref2vaEndpoint(config);
+
+  if (!endpoint) {
+    throw new Error('MiniMax-H3 Ref2VA endpoint 未配置');
+  }
+
   const resp = await fetch(
-    `${fl2vaEndpoint(config)}/v1/videos/${encodeURIComponent(nativeId)}/content`,
+    `${endpoint}/v1/videos/${encodeURIComponent(nativeId)}/content`,
     {
       headers: {
         Accept: 'video/mp4,application/octet-stream',

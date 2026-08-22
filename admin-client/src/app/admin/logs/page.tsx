@@ -36,22 +36,33 @@ export default function AdminLogsPage() {
           <thead>
             <tr className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
               <th className="text-left px-4 py-3 text-sm">用户</th>
+              <th className="text-left px-4 py-3 text-sm">类型</th>
               <th className="text-left px-4 py-3 text-sm">模型</th>
-              <th className="text-left px-4 py-3 text-sm">Tokens</th>
+              <th className="text-left px-4 py-3 text-sm">Tokens(入→出)</th>
+              <th className="text-left px-4 py-3 text-sm">单价</th>
+              <th className="text-left px-4 py-3 text-sm">金额</th>
+              <th className="text-left px-4 py-3 text-sm">费用(元)</th>
               <th className="text-left px-4 py-3 text-sm">耗时</th>
-              <th className="text-left px-4 py-3 text-sm">消耗</th>
               <th className="text-left px-4 py-3 text-sm">状态</th>
               <th className="text-left px-4 py-3 text-sm">时间</th>
             </tr>
           </thead>
           <tbody>
-            {logs.map(l => (
+            {logs.map(l => {
+              const ui = l.unitInfo || {};
+              const isLocal = l.model?.source === 'local';
+              return (
               <tr key={l.id} className="border-b border-gray-100 dark:border-gray-700/50 text-sm">
                 <td className="px-4 py-3">{l.user?.username || '—'}</td>
+                <td className="px-4 py-3">
+                  <span className={`px-2 py-0.5 rounded-full text-xs ${isLocal ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/30' : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30'}`}>{isLocal ? '本地' : '火山'}</span>
+                </td>
                 <td className="px-4 py-3 font-mono text-xs">{l.model?.name || '—'}</td>
                 <td className="px-4 py-3">{l.tokensInput || 0}→{l.tokensOutput || 0}</td>
+                <td className="px-4 py-3 text-xs text-gray-500">{ui.unit || '—'}</td>
+                <td className="px-4 py-3 text-xs">{ui.weightedUnit != null ? `${Number(ui.weightedUnit).toFixed(4)} 元/token` : '—'}</td>
+                <td className="px-4 py-3 font-medium">{Number(l.cost || 0).toFixed(3)}</td>
                 <td className="px-4 py-3">{l.durationMs ? `${l.durationMs}ms` : '—'}</td>
-                <td className="px-4 py-3">{l.cost || '—'}</td>
                 <td className="px-4 py-3">
                   <span className={`px-2 py-0.5 rounded-full text-xs ${l.status === 'success' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
                     {l.status === 'success' ? '成功' : l.status}
@@ -59,7 +70,7 @@ export default function AdminLogsPage() {
                 </td>
                 <td className="px-4 py-3 text-gray-500">{new Date(l.createdAt).toLocaleString('zh-CN')}</td>
               </tr>
-            ))}
+            );})}
           </tbody>
         </table>
         {logs.length === 0 && <div className="text-center py-12 text-gray-500">暂无日志</div>}

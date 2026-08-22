@@ -236,27 +236,35 @@ export default function AdminBillingPage() {
                             <tr className="border-b bg-gray-50 dark:bg-gray-800/50">
                               <th className="text-left px-4 py-3">ID</th>
                               <th className="text-left px-4 py-3">用户</th>
+                              <th className="text-left px-4 py-3">类型</th>
                               <th className="text-left px-4 py-3">模型</th>
                               <th className="text-right px-4 py-3">Tokens</th>
+                              <th className="text-left px-4 py-3">单价</th>
+                              <th className="text-right px-4 py-3">金额</th>
+                              <th className="text-right px-4 py-3">费用</th>
                               <th className="text-right px-4 py-3">耗时</th>
-                              <th className="text-right px-4 py-3">消耗</th>
                               <th className="text-left px-4 py-3">调用时间</th>
                             </tr>
                           </thead>
                           <tbody>
-                            {items.map((r: any) => (
+                            {items.map((r: any) => {
+                              const ui = r.unitInfo || {};
+                              return (
                               <tr key={r.id} className="border-b border-gray-100 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-800/50">
                                 <td className="px-4 py-3 text-gray-400 text-xs">{r.id}</td>
                                 <td className="px-4 py-3">{r.user}</td>
+                                <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-xs ${r.source === 'local' ? 'bg-orange-100 text-orange-700' : 'bg-blue-100 text-blue-700'}`}>{r.source === 'local' ? '本地' : '火山'}</span></td>
                                 <td className="px-4 py-3 font-mono text-xs">{r.model}</td>
                                 <td className="px-4 py-3 text-right text-xs text-gray-500">{r.tokensInput}→{r.tokensOutput}</td>
+                                <td className="px-4 py-3 text-xs text-gray-500">{ui.unit || '—'}</td>
+                                <td className="px-4 py-3 text-right text-xs">{ui.weightedUnit != null ? Number(ui.weightedUnit).toFixed(4) + '/token' : '—'}</td>
+                                <td className="px-4 py-3 text-right font-medium">{Number(r.cost || 0).toFixed(3)}</td>
                                 <td className="px-4 py-3 text-right text-xs text-gray-500">{r.durationMs ? `${r.durationMs}ms` : '—'}</td>
-                                <td className="px-4 py-3 text-right font-medium">{fmt(r.cost)}</td>
                                 <td className="px-4 py-3 text-xs text-gray-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</td>
                               </tr>
-                            ))}
+                            );})}
                             {items.length === 0 && (
-                              <tr><td colSpan={7} className="text-center py-8 text-gray-500">暂无数据</td></tr>
+                              <tr><td colSpan={10} className="text-center py-8 text-gray-500">暂无数据</td></tr>
                             )}
                           </tbody>
                         </table>
@@ -313,29 +321,35 @@ export default function AdminBillingPage() {
                     <th className="text-left px-4 py-3">模型</th>
                     <th className="text-left px-4 py-3">来源</th>
                     <th className="text-right px-4 py-3">Tokens</th>
+                    <th className="text-left px-4 py-3">单价</th>
+                    <th className="text-right px-4 py-3">金额</th>
+                    <th className="text-right px-4 py-3">费用</th>
                     <th className="text-right px-4 py-3">耗时</th>
-                    <th className="text-right px-4 py-3">消耗</th>
                     <th className="text-left px-4 py-3">调用时间</th>
                   </tr>
                 </thead>
                 <tbody>
                   {loading ? (
-                    <tr><td colSpan={8} className="text-center py-12 text-gray-500">加载中...</td></tr>
+                    <tr><td colSpan={10} className="text-center py-12 text-gray-500">加载中...</td></tr>
                   ) : data?.items?.length ? (
-                    data.items.map((r: any) => (
+                    data.items.map((r: any) => {
+                      const ui = r.unitInfo || {};
+                      return (
                       <tr key={r.id} className="border-b border-gray-100 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-800/50">
                         <td className="px-4 py-3 text-gray-400 text-xs">{r.id}</td>
                         <td className="px-4 py-3">{r.user}</td>
                         <td className="px-4 py-3 font-mono text-xs">{r.model}</td>
                         <td className="px-4 py-3">{sourceBadge(r.source)}</td>
                         <td className="px-4 py-3 text-right text-xs text-gray-500">{r.tokensInput}→{r.tokensOutput}</td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{ui.unit || '—'}</td>
+                        <td className="px-4 py-3 text-right text-xs">{ui.weightedUnit != null ? Number(ui.weightedUnit).toFixed(4) + '/token' : '—'}</td>
+                        <td className="px-4 py-3 text-right font-medium">{Number(r.cost || 0).toFixed(3)}</td>
                         <td className="px-4 py-3 text-right text-xs text-gray-500">{r.durationMs ? `${r.durationMs}ms` : '—'}</td>
-                        <td className="px-4 py-3 text-right font-medium">{fmt(r.cost)}</td>
                         <td className="px-4 py-3 text-xs text-gray-500">{new Date(r.createdAt).toLocaleString('zh-CN')}</td>
                       </tr>
-                    ))
+                    );})
                   ) : (
-                    <tr><td colSpan={8} className="text-center py-12 text-gray-500">暂无数据</td></tr>
+                    <tr><td colSpan={10} className="text-center py-12 text-gray-500">暂无数据</td></tr>
                   )}
                 </tbody>
               </table>

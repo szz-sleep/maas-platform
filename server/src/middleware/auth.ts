@@ -66,3 +66,32 @@ export async function adminAuth(request: FastifyRequest, reply: FastifyReply) {
     return reply.status(403).send({ success: false, error: { code: 'FORBIDDEN', message: '仅管理员可操作' } });
   }
 }
+
+/**
+ * 校验 Key 是否被允许使用指定模型（Key-Model 映射）。
+ * 规则：
+ *   - Key 没有任何模型映射（KeyModel 记录为 0）→ 拒绝（未配置 = 不可用任何模型）
+ *   - 有映射但 targetModelId 不在其中 → 拒绝
+ *   - targetModelId 在映射中 → 放行
+ * @returns {string|null} 返回 null 表示放行；否则返回拒绝原因（中文提示）
+ */
+export async function checkKeyModelAllowed(apiKeyId: number | undefined, targetModelId: number): Promise<string | null> {
+  if (!apiKeyId) return 'API Key 无效';
+  const mapped = await prisma.keyModel.findMany({ where: { apiKeyId } });
+  if (mapped.length === 0) {
+    return '该 API Key 未配置可用的模型，请联系管理员授权';
+  }
+  if (!mapped.some(km => km.modelId === targetModelId)) {
+    return '该 API Key 无权使用当前模型，请联系管理员授权';
+  }
+  return null;
+}
+
+/**
+ * 获取某 Key 允许使用的模型 ID 集合；若 Key 无任何映射，返回 null（表示不可用任何模型）
+ */
+export async function getAllowedModelIds(apiKeyId: number): Promise<Set<number> | null> {
+  const mapped = await prisma.keyModel.findMany({ where: { apiKeyId } });
+  if (mapped.length === 0) return null;
+  return new Set(mapped.map(km => km.modelId));
+}

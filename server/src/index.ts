@@ -4,8 +4,9 @@ import multipart from '@fastify/multipart';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { config, validateConfig } from './config';
-import { connectRedis } from './config/redis';
+import { connectRedis, disconnectRedis } from './config/redis';
 import { startModelSyncCron } from './services/model-sync-cron';
+import { startLocalVideoQueueWorker, stopLocalVideoQueueWorker } from './services/video/local-video';
 import authRoutes from './routes/auth';
 import userRoutes from './routes/user';
 import keyRoutes from './routes/key';
@@ -46,17 +47,21 @@ async function main() {
     const redisClient = getRedis();
 
     const rateLimit = await import('@fastify/rate-limit');
-    // 全局默认限流（宽松）
-    await app.register(rateLimit.default, {
-      max: 300,
-      timeWindow: '1 minute',
-      redis: redisClient,
-      keyGenerator: (req) => {
-        // 用 IP + User ID 组合作为 key
-        const userId = (req as any).user?.userId || 'anon';
-        return `${req.ip}:${userId}`;
-      },
-    });
+    // 全局默认限流（宽松）— 压测时可设 DISABLE_RATE_LIMIT=1 临时禁用
+    if (process.env.DISABLE_RATE_LIMIT === '1') {
+      app.log.info('⚠️  已按 DISABLE_RATE_LIMIT=1 临时禁用全局限流（仅供压测）');
+    } else {
+      await app.register(rateLimit.default, {
+        max: 300,
+        timeWindow: '1 minute',
+        redis: redisClient,
+        keyGenerator: (req) => {
+          // 用 IP + User ID 组合作为 key
+          const userId = (req as any).user?.userId || 'anon';
+          return `${req.ip}:${userId}`;
+        },
+      });
+    }
 
     // 认证接口限流（严格）— 通过路由级覆盖
     // 在 auth.ts 中单独配置
@@ -100,20 +105,58 @@ async function main() {
     console.warn('⚠️  模型同步启动失败（后台继续运行）:', err);
   }
 
+  // 初始化模型价格表（火山标准价 + 本地参考价；已存在的保留管理员自定义）
+  try {
+    const { seedModelPrices } = await import('./services/price-seed');
+    const seeded = await seedModelPrices(false);
+    console.log(`💲 模型价格表初始化完成（本次写入 ${seeded} 条，已有自定义价格保留）`);
+  } catch (err) {
+    console.warn('⚠️  价格表初始化失败:', err);
+  }
+
   // 健康检查
   app.get('/api/health', async () => ({ status: 'ok', timestamp: Date.now() }));
 
   // 连接 Redis
   await connectRedis();
 
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n🛑 收到 ${signal}，停止领取新的视频任务并关闭 MaaS...`);
+
+    try {
+      await stopLocalVideoQueueWorker();
+      await app.close();
+      await disconnectRedis();
+      console.log('✅ MaaS 已安全停止');
+      process.exit(0);
+    } catch (err) {
+      app.log.error(err);
+      process.exit(1);
+    }
+  };
+
+  process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.once('SIGINT', () => { void shutdown('SIGINT'); });
+
   // 启动服务
   try {
     await app.listen({ port: config.port, host: '0.0.0.0' });
+    startLocalVideoQueueWorker();
+
+    if (typeof process.send === 'function') {
+      process.send('ready');
+    }
+
     console.log(`\n🚀 MaaS 服务已启动: http://localhost:${config.port}`);
     console.log(`📚 API 文档: http://localhost:${config.port}/documentation`);
     console.log(`🏥 健康检查: http://localhost:${config.port}/api/health\n`);
   } catch (err) {
     app.log.error(err);
+    await stopLocalVideoQueueWorker().catch(() => undefined);
+    await disconnectRedis().catch(() => undefined);
     process.exit(1);
   }
 }

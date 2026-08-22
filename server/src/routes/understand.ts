@@ -8,7 +8,7 @@
 
 import { FastifyInstance } from 'fastify';
 import prisma from '../config/database';
-import { apiKeyAuth } from '../middleware/auth';
+import { apiKeyAuth, checkKeyModelAllowed } from '../middleware/auth';
 import { sha256 } from '../utils/apiKey';
 import { loadApiKey } from '../services/volcano';
 
@@ -31,6 +31,12 @@ export default async function understandRoutes(app: FastifyInstance) {
       }
       if (modelRecord.status !== 'online') {
         return reply.status(503).send({ success: false, error: { code: 'MODEL_OFFLINE', message: '模型当前不可用' } });
+      }
+
+      // Key 模型映射校验
+      const denyReason = await checkKeyModelAllowed(request.apiKeyId, modelRecord.id);
+      if (denyReason) {
+        return reply.status(403).send({ success: false, error: { code: 'MODEL_NOT_ALLOWED', message: denyReason } });
       }
 
       const apiKey = await loadApiKey();
